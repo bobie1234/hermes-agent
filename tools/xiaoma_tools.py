@@ -1,0 +1,1530 @@
+#!/usr/bin/env python3
+"""
+Xiaoma Project Tools — read/write project documents, list ledger files,
+and retrieve approved market/genre knowledge cards.
+
+Registered under toolset "xiaoma_project".  Path security follows the same
+resolve + relative_to pattern used by tools/path_security.py.
+"""
+
+import json
+import fnmatch
+import logging
+import os
+import re
+import sys
+import threading
+from pathlib import Path
+from typing import Optional
+
+
+def _ensure_runtime_root_on_syspath() -> None:
+    """Ensure packaged runtime can import repo-root modules like packages.*."""
+    candidates: list[Path] = []
+    env_root = os.environ.get("XIAOMA_APP_ROOT", "").strip()
+    if env_root:
+        candidates.append(Path(env_root))
+
+    mei = getattr(sys, "_MEIPASS", "")
+    if mei:
+        mei_path = Path(mei)
+        candidates.append(mei_path)
+        candidates.append(mei_path / "runtime" / "core")
+
+    candidates.append(Path(__file__).resolve().parents[3])
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not (resolved / "packages").exists():
+            continue
+        candidate_str = str(resolved)
+        if candidate_str not in sys.path:
+            sys.path.insert(0, candidate_str)
+
+
+_ensure_runtime_root_on_syspath()
+
+from packages.knowledge.topic_profiles import canonicalize_topic, get_topic_profile
+from tools.registry import registry, tool_error, tool_result
+
+logger = logging.getLogger(__name__)
+_EPISODE_CONTRACT_BLOCK_RE = re.compile(
+    r"^\s*```episode_contract\s*\n(.*?)\n```\s*",
+    re.DOTALL | re.IGNORECASE,
+)
+# Also accept contract block not at the very start of content (models
+# sometimes prefix with "现在开始写第1集" before the fence).
+_EPISODE_CONTRACT_BLOCK_SEARCH_RE = re.compile(
+    r"(?:^|\n)\s*```episode_contract\s*\n(.*?)\n```\s*",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# Methodology index — unified knowledge retrieval (replaces fixed stitching)
+# ---------------------------------------------------------------------------
+
+try:
+    from packages.knowledge.methodology_index import (
+        build_methodology_index,
+        query_index,
+        conflict_check,
+    )
+    _METHODOLOGY_INDEX_AVAILABLE = True
+except ImportError:
+    _METHODOLOGY_INDEX_AVAILABLE = False
+    logger.warning("methodology_index not available; falling back to fixed-file retrieval")
+
+try:
+    from packages.xiaoma_config import (
+        PROJECTS_ROOT as _PROJECTS_ROOT,
+        PROCESSED_ROOT as _KNOWLEDGE_ROOT,
+        STABLE_ROOT as _STABLE_ROOT,
+        REDFRUIT_ROOT as _REDFRUIT_ROOT,
+        TOPIC_PACKS_ROOT as _TOPIC_PACKS_ROOT,
+    )
+except ImportError:
+    import os
+    from pathlib import Path
+    _app_root = os.environ.get("XIAOMA_APP_ROOT", "")
+    if _app_root:
+        _base = Path(_app_root)
+    else:
+        _base = Path.cwd()
+        logger.warning(
+            "packages.xiaoma_config not importable and XIAOMA_APP_ROOT not set. "
+            "Falling back to CWD: %s. Set XIAOMA_APP_ROOT for deterministic paths.",
+            _base,
+        )
+    _PROJECTS_ROOT = _base / "data" / "projects"
+    _KNOWLEDGE_ROOT = _base / "packages" / "knowledge" / "processed"
+    _STABLE_ROOT = _base / "packages" / "knowledge" / "stable"
+    _REDFRUIT_ROOT = _KNOWLEDGE_ROOT / "redfruit-2026-05"
+    _TOPIC_PACKS_ROOT = _KNOWLEDGE_ROOT / "topic-packs"
+
+# ---------------------------------------------------------------------------
+# Security helpers (inline; avoids importing the full security module for
+# what amounts to two function calls, but keeps the same semantics).
+# ---------------------------------------------------------------------------
+
+_MAX_CARD_CHARS = 5000
+_MAX_CARD_SUMMARY_CHARS = 900
+# 单集正文硬上限（有效字数）。大模型不会精确数数，声明低锚点也可能写飞，
+# 这道墙是代码层兜底：实际正文超过此值一律拒写、引导压缩到 900 以内。
+# 字数三档从 xiaoma.episode_quality_contract 单源 import（潘总商业剧本校准 - 2026-06-15）
+from xiaoma.episode_quality_contract import (
+    EPISODE_HARD_MAX_CHARS,
+    EPISODE_MIN_WRITE_CHARS,
+    MIN_EPISODE_CHARS,
+    MAX_EPISODE_CHARS,
+)
+_WRITE_POLICIES_BY_THREAD: dict[int, dict] = {}
+_METHODOLOGY_TRACES_BY_THREAD: dict[int, dict] = {}
+_CANCELLED_PROJECTS: set[str] = set()
+_CANCEL_LOCK = threading.Lock()
+
+# A-EXECUTE-REALTIME-PROGRESS-SSE-01：进度 hook（agent 工具调用时触发）
+# orchestrator 注册一个回调，工具调用时推进度给前端（通过 SSE）
+_PROGRESS_SINK = None
+
+def set_progress_sink(callback):
+    """注册进度回调（orchestrator 在跑 agent 前调）。callback(dict) → 被 orchestrator 的 SSE 推给前端。"""
+    global _PROGRESS_SINK
+    _PROGRESS_SINK = callback
+
+def clear_progress_sink():
+    global _PROGRESS_SINK
+    _PROGRESS_SINK = None
+
+def _emit_progress(action: str, path: str):
+    """工具调用时触发进度信号。翻译表内置——绝不暴露 skill/tool/路径。"""
+    if _PROGRESS_SINK is None:
+        return
+    msg = _translate_tool_to_progress(action, path)
+    if msg:
+        try:
+            _PROGRESS_SINK({"progress": msg, "action": action, "path": path})
+        except Exception:
+            pass  # 进度推送失败不影响主流程
+
+def _translate_tool_to_progress(action: str, path: str) -> str:
+    """工具调用 → 用户语言翻译表。核心：绝不暴露内部词。"""
+    p = str(path or "").replace("\\", "/").strip()
+    if action == "read":
+        if "project_brief" in p: return "正在回顾灵感设定"
+        if "synopsis" in p: return "正在回顾故事梗概"
+        if "outline" in p: return "正在回顾故事大纲"
+        if p.startswith("characters/"): return "正在回顾人物设定"
+        if p.startswith("episodes/"): return "正在回顾已有剧集"
+        if p.startswith("ledger/"): return "正在整理连续性记录"
+        if p.rstrip("/") == "episodes": return "正在整理已写剧集"
+        if p.rstrip("/") == "characters": return "正在整理人物列表"
+        return "正在读取项目内容"
+    elif action == "write":
+        if p.startswith("episodes/ep"):
+            # ep022 → 本轮第N集（从 ep 号算本轮序号，需要 external context）
+            # 简化：直接用集号 - base + 1，但 base 未知，这里只返回"正在写入剧集"
+            return "正在写入剧集"
+        if "project_brief" in p: return "正在生成灵感总结"
+        if "synopsis" in p: return "正在生成故事梗概"
+        if "outline" in p: return "正在生成故事大纲"
+        if p.startswith("characters/"): return "正在生成人物设定"
+        return "正在写入内容"
+    elif action == "list":
+        return "正在整理项目内容"
+    elif action == "skill":
+        return "正在构思剧情"
+    return ""
+
+
+def mark_project_cancelled(project_id: str) -> None:
+    """Best-effort cancellation gate for long-running project writes."""
+    if not project_id:
+        return
+    with _CANCEL_LOCK:
+        _CANCELLED_PROJECTS.add(str(project_id))
+
+
+def clear_project_cancelled(project_id: str) -> None:
+    if not project_id:
+        return
+    with _CANCEL_LOCK:
+        _CANCELLED_PROJECTS.discard(str(project_id))
+
+
+def _is_project_cancelled(project_id: str) -> bool:
+    with _CANCEL_LOCK:
+        return str(project_id) in _CANCELLED_PROJECTS
+
+
+def start_methodology_trace(
+    run_id: str,
+    project_id: str,
+    page: str,
+    expected_skills: list[str] | None = None,
+) -> None:
+    """Start a per-thread methodology trace for one Hermes run."""
+    _METHODOLOGY_TRACES_BY_THREAD[threading.get_ident()] = {
+        "run_id": run_id,
+        "project_id": project_id,
+        "page": page,
+        "expected_skills": expected_skills or [],
+        "skills_loaded": [],
+        "cards_retrieved": [],
+        "rules_conflicts": [],
+        "project_docs_read": [],
+        "project_docs_written": [],
+        "project_docs_listed": [],
+        "ledger_docs_read": [],
+        "warnings": [],
+        "tool_failure_counts": {},
+    }
+
+
+def consume_methodology_trace() -> dict:
+    """Return and clear the current thread's methodology trace."""
+    return _METHODOLOGY_TRACES_BY_THREAD.pop(threading.get_ident(), {})
+
+
+def _active_methodology_trace() -> Optional[dict]:
+    return _METHODOLOGY_TRACES_BY_THREAD.get(threading.get_ident())
+
+
+def _append_unique_trace_list(key: str, value) -> None:
+    trace = _active_methodology_trace()
+    if trace is None:
+        return
+    bucket = trace.setdefault(key, [])
+    if value not in bucket:
+        bucket.append(value)
+
+
+# A-STOPLOSS-THRESHOLD-BLACKBOX-01：stop_loss 阈值常量（原硬编码 5）。
+# 字数超限时模型需多次压缩尝试，给到 5 次机会。抽常量便于可观测/可调。
+STOP_LOSS_FAILURE_LIMIT = 5
+
+
+def _tool_failure(tool_name: str, project_id: str, message: str) -> str:
+    """Record repeated tool failures and stop a run after STOP_LOSS_FAILURE_LIMIT.
+
+    A-STOPLOSS-THRESHOLD-BLACKBOX-01（根因级修法，波别 2026-06-15）：
+    旧逻辑连续失败超阈值后 `mark_project_cancelled` 取消整个 project，
+    导致同 run 已成功的其他集（如 ep016-018）被连累——"一集失败陪葬全轮"。
+    现改为：超阈值只停止该工具的继续重试（return error + warning），
+    **不再 mark_project_cancelled**，同 run 其他未失败文件不受连累。
+    额度保护仍由"单次工具失败计数 + 超限停止重试"保证（每次失败消耗一次
+    模型调用，超限后该工具停止，不会无限消耗）。project 级 cancel 只留给
+    真正的致命故障（os/系统层），不因单文件字数失败触发。
+    """
+    trace = _active_methodology_trace()
+    if trace is None:
+        return tool_error(message)
+
+    counts = trace.setdefault("tool_failure_counts", {})
+    count = int(counts.get(tool_name, 0) or 0) + 1
+    counts[tool_name] = count
+    if count > STOP_LOSS_FAILURE_LIMIT:
+        _append_unique_trace_list(
+            "warnings",
+            f"tool_failure_stop_loss: {tool_name} failed {count}/{STOP_LOSS_FAILURE_LIMIT} times (single-file stop, run preserved)",
+        )
+        return tool_error(
+            f"该文件已连续写入失败 {STOP_LOSS_FAILURE_LIMIT} 次，停止重试此文件。"
+            "其他文件不受影响，请精简内容或点「检查问题」后重试本文件。"
+        )
+    return tool_error(message)
+
+
+def record_skill_loaded(name: str, path: str | None = None) -> None:
+    item = {"name": name}
+    if path:
+        item["path"] = path
+    _append_unique_trace_list("skills_loaded", item)
+
+
+def _record_cards_retrieved(args: dict, cards: list[dict], conflicts: list[dict]) -> None:
+    trace = _active_methodology_trace()
+    if trace is None:
+        return
+    for card in cards:
+        item = {
+            "id": card.get("id"),
+            "path": card.get("path"),
+            "priority": card.get("priority"),
+            "score": card.get("score"),
+            "reason": card.get("reason"),
+            "query": {
+                "stage": args.get("stage"),
+                "format": args.get("format"),
+                "topic": args.get("topic"),
+                "audience": args.get("audience"),
+                "task": args.get("task"),
+                "problem": args.get("problem"),
+            },
+        }
+        _append_unique_trace_list("cards_retrieved", item)
+    for conflict in conflicts or []:
+        _append_unique_trace_list("rules_conflicts", conflict)
+
+
+def set_project_write_policy(policy: dict | None) -> None:
+    """Set write policy for the current agent execution thread."""
+    thread_id = threading.get_ident()
+    if policy is None:
+        _WRITE_POLICIES_BY_THREAD.pop(thread_id, None)
+    else:
+        _WRITE_POLICIES_BY_THREAD[thread_id] = policy
+
+
+def clear_project_write_policy() -> None:
+    _WRITE_POLICIES_BY_THREAD.pop(threading.get_ident(), None)
+
+
+def active_project_write_policy() -> Optional[dict]:
+    return _WRITE_POLICIES_BY_THREAD.get(threading.get_ident())
+
+
+def _active_workspace_snapshot_cache() -> dict:
+    policy = active_project_write_policy() or {}
+    cache = policy.get("workspace_snapshot_cache")
+    return cache if isinstance(cache, dict) else {}
+
+
+def _normalize_project_doc_trace_path(path: str, *, is_dir: bool = False) -> str:
+    raw = str(path or "").strip().replace("\\", "/")
+    if raw in {"", ".", "/", "./"}:
+        return "."
+    normalized = raw.strip("/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if not normalized:
+        return "."
+    return f"{normalized.rstrip('/')}/" if is_dir else normalized.rstrip("/")
+
+
+def _project_doc_read_satisfies(required_path: str, read_docs: list[str] | tuple[str, ...]) -> bool:
+    required = _normalize_project_doc_trace_path(
+        required_path,
+        is_dir=str(required_path or "").replace("\\", "/").strip().endswith("/"),
+    )
+    read_set = {
+        _normalize_project_doc_trace_path(path)
+        for path in (read_docs or [])
+        if str(path or "").strip()
+    }
+    if required in read_set:
+        return True
+    if required.endswith("/"):
+        return any(path.startswith(required) and path != required for path in read_set)
+    return False
+
+
+def _path_allowed_by_policy(project_id: str, path: str) -> Optional[str]:
+    policy = active_project_write_policy()
+    if not policy or policy.get("project_id") != project_id:
+        return None
+    if policy.get("mode") == "deny":
+        return policy.get("message") or "当前流程不允许直接写项目文件"
+    required_reads = [str(item).strip() for item in (policy.get("required_reads_before_write") or []) if str(item).strip()]
+    if required_reads:
+        trace = _active_methodology_trace() or {}
+        # 预载进 system_message 的文档 agent 已经看到（_build_execute_preloaded_reads
+        # 把 ledger/ 等前置正文拼进 system_message），等价于"已读"，必须合并进来。
+        # 否则会出现"内容已塞给 agent、却因 agent 没主动调 read 被拦死写集"的问题。
+        preloaded = [
+            _normalize_project_doc_trace_path(str(item))
+            for item in (policy.get("preloaded_reads") or [])
+            if str(item).strip()
+        ]
+        read_docs = [
+            _normalize_project_doc_trace_path(str(item))
+            for item in (trace.get("project_docs_read") or [])
+        ] + preloaded
+        missing_reads = []
+        for item in required_reads:
+            # 目录型 required（如 ledger/）：项目里该目录不存在（老项目没生成过账本/
+            # 约束书，它们是生成大纲时才自动产出）→ 不强制读，避免误拦写集。
+            if item.endswith("/"):
+                try:
+                    if not (_PROJECTS_ROOT / project_id / item.rstrip("/")).exists():
+                        continue
+                except OSError:
+                    continue
+            if not _project_doc_read_satisfies(item, read_docs):
+                missing_reads.append(item)
+        if missing_reads:
+            return f"写入前必须先读取：{', '.join(missing_reads)}"
+    specific_writes = [
+        _normalize_project_doc_trace_path(str(item))
+        for item in (policy.get("allowed_specific_writes") or [])
+        if str(item).strip()
+    ]
+    normalized_path = _normalize_project_doc_trace_path(path)
+    if specific_writes and not any(
+        normalized_path == item or fnmatch.fnmatch(normalized_path, item)
+        for item in specific_writes
+    ):
+        # 超出本轮 specific-write 范围 —— 这是"集号/批次超范围"，
+        # 不是"越页面"。必须给 agent 一条带具体允许文件的专属文案，
+        # 让它自纠到范围内的集，而不是套用 policy.message（那条是为
+        # "越 allowed_paths 页面"写的，会把 agent 带沟里）。
+        return (
+            f"本轮只允许写这些文件：{', '.join(specific_writes)}；"
+            f"你写的 {normalized_path} 超出本轮范围。"
+            f"请改写允许范围内的文件，不要写范围外的集号或路径。"
+        )
+    allowed = policy.get("allowed_paths") or []
+    for item in allowed:
+        item = str(item).strip()
+        if not item:
+            continue
+        if item.endswith("/"):
+            if path.startswith(item):
+                return None
+        elif path == item:
+            return None
+    return (
+        policy.get("message")
+        or f"当前页面只允许写入：{', '.join(allowed)}；拒绝越级写入 {path}"
+    )
+
+_STAGE_FILES = {
+    "inspiration": [
+        "cards-index.md",
+        "trend-brief.md",
+        "genre-opportunity-matrix.md",
+        "platform-trends/CARD-TREND-001-ai-manhua-mainstage.md",
+        "platform-trends/CARD-TREND-002-female-ai-gap.md",
+        "platform-trends/CARD-TREND-012-format-choice.md",
+        "platform-trends/CARD-TREND-013-good-to-do-matrix.md",
+    ],
+    "synopsis": [
+        "platform-trends/CARD-TREND-009-first-three-episodes.md",
+        "platform-trends/CARD-TREND-010-ip-seriality.md",
+        "manhua-opening-hooks/CARD-MANHUA-OPENING-001-shock-contrast.md",
+        "manhua-opening-hooks/CARD-MANHUA-OPENING-002-extreme-crisis.md",
+        "manhua-opening-hooks/CARD-MANHUA-OPENING-005-hybrid-hook.md",
+        "ad-materials/CARD-AD-003-identity-contrast.md",
+        "ad-materials/CARD-AD-010-power-reversal.md",
+    ],
+    "outline": [
+        "manhua-rhythm/CARD-MANHUA-RHYTHM-001-ai-real.md",
+        "manhua-rhythm/CARD-MANHUA-RHYTHM-004-female.md",
+        "manhua-rhythm/CARD-MANHUA-RHYTHM-005-selfcheck.md",
+        "platform-trends/CARD-TREND-009-first-three-episodes.md",
+        "ad-materials/CARD-AD-002-visual-spectacle.md",
+    ],
+    "episodes": [
+        "manhua-rhythm/CARD-MANHUA-RHYTHM-001-ai-real.md",
+        "manhua-rhythm/CARD-MANHUA-RHYTHM-005-selfcheck.md",
+        "ad-materials/CARD-AD-001-rule-reveal.md",
+        "ad-materials/CARD-AD-002-visual-spectacle.md",
+        "ad-materials/CARD-AD-004-premonition-planning.md",
+        "ad-materials/CARD-AD-009-safehouse-comfort.md",
+    ],
+}
+
+_STABLE_STAGE_FILES = {
+    "inspiration": [
+        "redfruit-four-stage-structure-2026-05.md",
+        "redfruit-first-episode-hook-rules-2026-05.md",
+        "redfruit-realistic-plot-power-rules-2026-05.md",
+        "first-three-episode-scorecard-2026-05.md",
+        "hook-and-reversal-rules-2026-05.md",
+        "character-empathy-rules-2026-05.md",
+    ],
+    "synopsis": [
+        "short-drama-compliance-hard-rules-2026-05.md",
+        "redfruit-four-stage-structure-2026-05.md",
+        "redfruit-first-episode-hook-rules-2026-05.md",
+        "redfruit-cheat-layering-rules-2026-05.md",
+        "redfruit-antagonist-tier-rules-2026-05.md",
+        "redfruit-realistic-plot-power-rules-2026-05.md",
+        "first-three-episode-scorecard-2026-05.md",
+        "plot-density-rules-2026-05.md",
+        "hook-and-reversal-rules-2026-05.md",
+        "character-empathy-rules-2026-05.md",
+    ],
+    "outline": [
+        "short-drama-compliance-hard-rules-2026-05.md",
+        "redfruit-four-stage-structure-2026-05.md",
+        "redfruit-cheat-layering-rules-2026-05.md",
+        "redfruit-antagonist-tier-rules-2026-05.md",
+        "redfruit-ad-material-rules-2026-05.md",
+        "first-three-episode-scorecard-2026-05.md",
+        "plot-density-rules-2026-05.md",
+        "hook-and-reversal-rules-2026-05.md",
+        "character-empathy-rules-2026-05.md",
+    ],
+    "episodes": [
+        "script-format-rules-2026-05.md",
+        "short-drama-compliance-hard-rules-2026-05.md",
+        "redfruit-four-stage-structure-2026-05.md",
+        "redfruit-first-episode-hook-rules-2026-05.md",
+        "redfruit-cheat-layering-rules-2026-05.md",
+        "redfruit-antagonist-tier-rules-2026-05.md",
+        "redfruit-ad-material-rules-2026-05.md",
+        "first-three-episode-scorecard-2026-05.md",
+        "plot-density-rules-2026-05.md",
+        "hook-and-reversal-rules-2026-05.md",
+        "character-empathy-rules-2026-05.md",
+    ],
+}
+
+_PROCESSED_STAGE_FILES = {
+    "inspiration": [
+        "female-first-ten-episodes-beat-sheet-2026-05.md",
+        "male-superpower-revenge-first-three-episodes-2026-05.md",
+    ],
+    "synopsis": [
+        "female-first-ten-episodes-beat-sheet-2026-05.md",
+        "male-superpower-revenge-first-three-episodes-2026-05.md",
+    ],
+    "outline": [
+        "female-first-ten-episodes-beat-sheet-2026-05.md",
+        "male-superpower-revenge-first-three-episodes-2026-05.md",
+    ],
+    "episodes": [
+        "female-first-ten-episodes-beat-sheet-2026-05.md",
+        "male-superpower-revenge-first-three-episodes-2026-05.md",
+    ],
+}
+
+_PATTERN_STAGE_FILES = {
+    "inspiration": [
+        "patterns/audience-emotion-map.md",
+        "patterns/archetype-library.md",
+    ],
+    "synopsis": [
+        "patterns/audience-emotion-map.md",
+        "patterns/archetype-library.md",
+        "patterns/worldbuilding-atlas.md",
+    ],
+    "outline": [
+        "patterns/pacing-atlas.md",
+        "patterns/worldbuilding-atlas.md",
+        "patterns/ad-material-atlas.md",
+    ],
+    "episodes": [
+        "patterns/pacing-atlas.md",
+        "patterns/ad-material-atlas.md",
+    ],
+}
+
+_TOPIC_CASE_FILES = {
+    "xianxia": [
+        "blockbuster-cases/CASE-BLOCKBUSTER-009-shanhai-cangxu.md",
+        "blockbuster-cases/CASE-BLOCKBUSTER-006-fanren-baishishu.md",
+        "blockbuster-cases/CASE-BLOCKBUSTER-008-xianwo-feigen.md",
+        "blockbuster-cases/CASE-BLOCKBUSTER-010-wotinei-youtiaolong.md",
+        "blockbuster-cases/CASE-BLOCKBUSTER-001-wanyao-tuluzhuan-s5.md",
+    ],
+    "rule-horror-infinite": [
+        "blockbuster-cases/CASE-BLOCKBUSTER-011-rixin-yiwan.md",
+    ],
+    "female-housefight-rebirth": [
+        "blockbuster-cases/CASE-BLOCKBUSTER-003-buzheng-fengyue.md",
+        "blockbuster-cases/CASE-BLOCKBUSTER-013-chuancheng-paohui.md",
+        "blockbuster-cases/CASE-BLOCKBUSTER-018-chongsheng70.md",
+    ],
+    "family-comedy": [
+        "blockbuster-cases/CASE-BLOCKBUSTER-007-datang-sizi.md",
+        "blockbuster-cases/CASE-BLOCKBUSTER-016-tiaopi-lebao.md",
+    ],
+    "professional-romance": [
+        "blockbuster-cases/CASE-BLOCKBUSTER-002-shangan-zhanwo.md",
+        "blockbuster-cases/CASE-BLOCKBUSTER-012-lihun-renqin.md",
+        "blockbuster-cases/CASE-BLOCKBUSTER-017-zhaoxue-jiche.md",
+    ],
+}
+
+_TOPIC_STAGE_FILES = {
+    "inspiration": ["README.md", "brainholes.md", "case-index.md", "pitfalls.md"],
+    "synopsis": ["README.md", "first-3-episodes.md", "character-hooks.md", "brainholes.md"],
+    "outline": ["README.md", "first-3-episodes.md", "tropes.md", "plot-modules.md", "punch-modules.md", "scene-and-visual.md"],
+    "episodes": ["first-3-episodes.md", "plot-modules.md", "punch-modules.md", "scene-and-visual.md", "pitfalls.md"],
+}
+
+
+def _resolve_project_path(project_id: str, path: str) -> Optional[Path]:
+    """Resolve a project-relative path and validate it stays within bounds.
+
+    Uses WorkspacePathResolver to enforce:
+      - No path traversal (relative_to check)
+      - Only allowed file extensions and paths
+      - No absolute paths or outside-workspace writes
+
+    Returns the absolute Path if safe, or None on violation.
+    """
+    try:
+        from packages.workspace_resolver import resolve_project_path as _resolver
+        return _resolver(project_id, path, projects_root=_PROJECTS_ROOT)
+    except ImportError:
+        pass
+
+    # Fallback: basic traversal protection (when resolver module unavailable)
+    project_root = (_PROJECTS_ROOT / project_id).resolve()
+    target = (project_root / path).resolve()
+    try:
+        target.relative_to(project_root)
+    except ValueError:
+        return None
+    return target
+
+
+def _check_project_id(project_id: str) -> Optional[str]:
+    """Reject project IDs with path-traversal components.
+
+    Returns an error message string or None if the ID is safe.
+    """
+    if not project_id or not project_id.strip():
+        return "project_id is required"
+    # Block obvious traversal and separator injection
+    forbidden = {"..", "/", "\\", "\x00"}
+    if any(c in project_id for c in forbidden):
+        return f"Invalid project_id: {project_id!r}"
+    return None
+
+
+def _clean_markdown_for_workspace(text: str) -> str:
+    """Keep generated project docs readable in the UI editor."""
+    lines = []
+    table_rule = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
+    for raw_line in text.replace("\r\n", "\n").split("\n"):
+        line = raw_line
+        if re.match(r"^\s*-{3,}\s*$", line) or table_rule.match(line):
+            continue
+        line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)
+        line = re.sub(r"\*\*([^*]+)\*\*", r"\1", line)
+        line = re.sub(r"__([^_]+)__", r"\1", line)
+        line = re.sub(r"`([^`]+)`", r"\1", line)
+        line = re.sub(r"^\s*[-*+]\s+", "", line)
+        line = re.sub(r"^\s*\d+\.\s+", "", line)
+        lines.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).lstrip()
+
+
+def _normalize_topic(topic: str) -> str:
+    return canonicalize_topic(topic)
+
+
+def _read_knowledge_file(base: Path, relative_path: str) -> Optional[dict]:
+    target = (base / relative_path).resolve()
+    try:
+        target.relative_to(base.resolve())
+    except ValueError:
+        return None
+    if not target.exists() or not target.is_file():
+        return None
+    try:
+        return {
+            "path": str(target.relative_to(_KNOWLEDGE_ROOT)),
+            "content": target.read_text(encoding="utf-8").strip(),
+        }
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _read_stable_file(relative_path: str) -> Optional[dict]:
+    target = (_STABLE_ROOT / relative_path).resolve()
+    try:
+        target.relative_to(_STABLE_ROOT.resolve())
+    except ValueError:
+        return None
+    if not target.exists() or not target.is_file():
+        return None
+    try:
+        return {
+            "path": str(target.relative_to(_STABLE_ROOT.parent)),
+            "content": target.read_text(encoding="utf-8").strip(),
+        }
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _append_card(cards: list, card: Optional[dict], budget: int) -> int:
+    if not card or not card.get("content"):
+        return budget
+    summary = _compact_card_content(card["content"], budget)
+    cards.append({
+        "path": card["path"],
+        "summary": summary,
+        "truncated": len(card["content"]) > len(summary),
+    })
+    return budget - len(summary)
+
+
+def _compact_card_content(content: str, budget: int) -> str:
+    """Return a bounded, readable card excerpt for model context."""
+    max_chars = max(0, min(budget, _MAX_CARD_SUMMARY_CHARS))
+    if len(content) <= max_chars:
+        return content
+    if max_chars <= 80:
+        return "[截断：超出本次检索预算]"
+    return content[: max_chars - 80].rstrip() + "\n\n[截断：超出本次检索预算；如需全文请按 path 精确读取]"
+
+
+_CHINESE_DIGITS = {
+    "零": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+
+
+def _parse_chinese_int(raw: str) -> Optional[int]:
+    text = (raw or "").strip().lstrip("零")
+    if not text:
+        return 0
+    if text == "十":
+        return 10
+    if "百" in text:
+        left, right = (text.split("百", 1) + [""])[:2]
+        hundreds = _CHINESE_DIGITS.get(left, 1 if not left else -1)
+        if hundreds <= 0:
+            return None
+        rest = _parse_chinese_int(right) if right else 0
+        return None if rest is None else hundreds * 100 + rest
+    if "十" in text:
+        left, right = (text.split("十", 1) + [""])[:2]
+        tens = _CHINESE_DIGITS.get(left, 1 if not left else -1)
+        ones = _CHINESE_DIGITS.get(right, 0 if not right else -1)
+        if tens <= 0 or ones < 0:
+            return None
+        return tens * 10 + ones
+    if len(text) == 1:
+        return _CHINESE_DIGITS.get(text)
+    return None
+
+
+def _episode_number_from_path(path: str) -> Optional[int]:
+    normalized = (path or "").replace("\\", "/")
+    name = Path(normalized).name
+    for pattern in (
+        r"^(?:ep|e)(\d{1,4})\.md$",
+        r"^第\s*(\d{1,4})\s*集\.md$",
+        r"^(\d{1,4})\.md$",
+    ):
+        match = re.search(pattern, name, re.IGNORECASE)
+        if match:
+            value = int(match.group(1))
+            return value if value > 0 else None
+    chinese = re.search(r"^第\s*([零一二两三四五六七八九十百]{1,8})\s*集\.md$", name)
+    if chinese:
+        value = _parse_chinese_int(chinese.group(1))
+        return value if value and value > 0 else None
+    return None
+
+
+def _normalize_episode_doc_path(path: str) -> str:
+    normalized = (path or "").replace("\\", "/")
+    if not normalized.startswith("episodes/"):
+        return path
+    number = _episode_number_from_path(normalized)
+    if number is None:
+        return path
+    return f"episodes/ep{number:03d}.md"
+
+
+_PROJECT_DOC_PATH_ALIASES = {
+    "灵感总结.md": "project_brief.md",
+    "项目灵感.md": "project_brief.md",
+    "项目简介.md": "project_brief.md",
+    "梗概.md": "synopsis.md",
+    "故事梗概.md": "synopsis.md",
+    "剧情梗概.md": "synopsis.md",
+    "大纲.md": "outline.md",
+    "短剧大纲.md": "outline.md",
+    "全集大纲.md": "outline.md",
+    "短剧全集大纲.md": "outline.md",
+    "分集大纲.md": "outline.md",
+    "剧集大纲.md": "outline.md",
+}
+
+
+def _canonical_project_doc_path(path: str) -> str:
+    """Map user-facing stage document names to canonical internal paths."""
+    normalized = (path or "").replace("\\", "/")
+    path_obj = Path(normalized)
+    alias = _PROJECT_DOC_PATH_ALIASES.get(path_obj.name)
+    if not alias:
+        return path
+    parent = "" if str(path_obj.parent) in {"", "."} else str(path_obj.parent).replace("\\", "/")
+    return alias if not parent else f"{parent}/{alias}"
+
+
+def _project_doc_sort_key(path: Path) -> tuple[int, int, str]:
+    parent = path.parent.name
+    number = _episode_number_from_path(path.name) if parent == "episodes" else None
+    if number is not None:
+        return (0, number, path.name.lower())
+    return (1, 0, path.name.lower())
+
+
+# ---------------------------------------------------------------------------
+# Tool handlers
+# ---------------------------------------------------------------------------
+
+
+def read_project_doc(args: dict, **kw) -> str:
+    """Read a project document file at ``data/projects/{project_id}/{path}``.
+
+    Schema:
+        project_id (str): Project identifier
+        path (str):      File path relative to the project directory
+    """
+    project_id = args.get("project_id", "")
+    path = args.get("path", "")
+    path = _normalize_episode_doc_path(_canonical_project_doc_path(path))
+
+    if _is_project_cancelled(project_id):
+        return _tool_failure("read_project_doc", project_id, "本轮任务已停止，拒绝继续读取项目内容。")
+
+    err = _check_project_id(project_id)
+    if err:
+        return _tool_failure("read_project_doc", project_id, err)
+
+    target = _resolve_project_path(project_id, path)
+    if target is None:
+        return _tool_failure("read_project_doc", project_id, f"Path traversal blocked: {path!r}")
+
+    snapshot_cache = _active_workspace_snapshot_cache()
+    snapshot_files = snapshot_cache.get("files") if isinstance(snapshot_cache.get("files"), dict) else {}
+    if path in snapshot_files:
+        content = str(snapshot_files.get(path) or "")
+        _append_unique_trace_list("project_docs_read", path)
+        _emit_progress("read", path)
+        return tool_result(
+            success=True,
+            content=content,
+            path=path,
+            bytes=len(content),
+            source="workspace_snapshot",
+        )
+
+    if not target.exists():
+        return _tool_failure("read_project_doc", project_id, f"File not found: data/projects/{project_id}/{path}")
+
+    if not target.is_file():
+        return _tool_failure("read_project_doc", project_id, f"Not a file: data/projects/{project_id}/{path}")
+
+    try:
+        content = target.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return _tool_failure(
+            "read_project_doc",
+            project_id,
+            f"Cannot read binary file: data/projects/{project_id}/{path}"
+        )
+    except Exception as exc:
+        return _tool_failure("read_project_doc", project_id, f"Read error: {exc}")
+
+    _append_unique_trace_list(
+        "project_docs_read",
+        target.relative_to(_PROJECTS_ROOT / project_id).as_posix(),
+    )
+
+    return tool_result(
+        success=True,
+        content=content,
+        path=target.relative_to(_PROJECTS_ROOT / project_id).as_posix(),
+        bytes=len(content),
+    )
+
+
+def _resolve_project_dir(project_id: str, path: str) -> Optional[Path]:
+    """Resolve a project-relative *directory* path (root aliases allowed).
+
+    Uses WorkspacePathResolver.resolve_project_dir when available; falls back
+    to basic traversal protection otherwise. Returns the absolute directory
+    Path if safe, or None on violation / unknown directory.
+    """
+    try:
+        from packages.workspace_resolver import resolve_project_dir as _dir_resolver
+        return _dir_resolver(project_id, path, projects_root=_PROJECTS_ROOT)
+    except ImportError:
+        pass
+
+    # Fallback: treat root aliases as project root and allow only known
+    # listable directories. Keep this path strict because it runs when the
+    # canonical resolver cannot be imported in packaged builds.
+    stripped = (path or "").strip()
+    normalized = "" if stripped in {"", ".", "/", "./", "\\"} else stripped.replace("\\", "/").strip("/")
+    if ".." in normalized.split("/"):
+        return None
+    if normalized not in {"", "characters", "episodes", "ledger", "runs", "traces", "manhua_prompts"}:
+        return None
+    project_root = (_PROJECTS_ROOT / project_id).resolve()
+    target = (project_root / normalized).resolve() if normalized else project_root
+    try:
+        target.relative_to(project_root)
+    except ValueError:
+        return None
+    return target
+
+
+def list_project_docs(args: dict, **kw) -> str:
+    """List project files under a directory, with optional short previews.
+
+    Schema:
+        project_id (str): Project identifier
+        path (str):      Directory path relative to the project directory.
+                         Empty / "." / "/" all mean the project root.
+        include_content (bool): Include content preview for each text file
+        max_chars (int): Maximum preview characters per file
+    """
+    project_id = args.get("project_id", "")
+    path = args.get("path", "")
+    include_content = bool(args.get("include_content", False))
+    max_chars = int(args.get("max_chars") or 1200)
+    max_chars = max(200, min(max_chars, 5000))
+
+    err = _check_project_id(project_id)
+    if err:
+        return tool_error(err)
+
+    snapshot_cache = _active_workspace_snapshot_cache()
+    snapshot_dirs = snapshot_cache.get("dirs") if isinstance(snapshot_cache.get("dirs"), dict) else {}
+    normalized_input = "" if (path or "").strip() in {"", ".", "/", "./", "\\"} else (path or "").strip().replace("\\", "/").strip("/")
+    if normalized_input in snapshot_dirs:
+        result_files = []
+        for child in sorted(snapshot_dirs.get(normalized_input) or [], key=lambda item: _project_doc_sort_key(Path(str(item.get("path") or "")))):
+            item = {
+                "name": str(child.get("name") or Path(str(child.get("path") or "")).name),
+                "path": str(child.get("path") or ""),
+                "bytes": int(child.get("bytes") or len(str(child.get("content") or ""))),
+            }
+            if include_content:
+                content = str(child.get("content") or "")
+                item["content_preview"] = content[:max_chars]
+                item["truncated"] = len(content) > max_chars
+                _append_unique_trace_list("project_docs_read", item["path"])
+            result_files.append(item)
+
+        trace_path = _normalize_project_doc_trace_path(normalized_input, is_dir=bool(normalized_input))
+        _append_unique_trace_list("project_docs_listed", trace_path or ".")
+        return tool_result(
+            success=True,
+            path=path,
+            files=result_files,
+            dirs=[],
+            count=len(result_files),
+            source="workspace_snapshot",
+        )
+
+    target = _resolve_project_dir(project_id, path)
+    if target is None:
+        return tool_error(
+            f"Invalid directory: {path!r}. Use '' / '.' for the project root, "
+            "or a known subdirectory (characters/, episodes/, ledger/, "
+            "manhua_prompts/, runs/, traces/)."
+        )
+
+    if not target.exists():
+        return tool_result(success=True, path=path, files=[], dirs=[], count=0)
+
+    if not target.is_dir():
+        return tool_error(f"Not a directory: data/projects/{project_id}/{path}")
+
+    project_root = (_PROJECTS_ROOT / project_id).resolve()
+    files = sorted(
+        [child for child in target.iterdir() if child.is_file()],
+        key=_project_doc_sort_key,
+    )
+    dirs = [
+        child.relative_to(project_root).as_posix() + "/"
+        for child in sorted(target.iterdir())
+        if child.is_dir()
+    ]
+
+    result_files = []
+    for child in files:
+        child_path = child.relative_to(project_root).as_posix()
+        item = {
+            "name": child.name,
+            "path": child_path,
+            "bytes": child.stat().st_size,
+        }
+        if include_content:
+            try:
+                content = child.read_text(encoding="utf-8")
+                item["content_preview"] = content[:max_chars]
+                item["truncated"] = len(content) > max_chars
+                _append_unique_trace_list("project_docs_read", child_path)
+            except (UnicodeDecodeError, OSError):
+                item["content_preview"] = "[binary or unreadable file]"
+                item["truncated"] = False
+        result_files.append(item)
+
+    trace_path = "" if (path or "").strip() in {"", ".", "/", "./", "\\"} else (path or "").strip().replace("\\", "/").strip("/")
+    trace_path = _normalize_project_doc_trace_path(trace_path, is_dir=bool(trace_path))
+    _append_unique_trace_list("project_docs_listed", trace_path or ".")
+
+    return tool_result(
+        success=True,
+        path=path,
+        files=result_files,
+        dirs=dirs,
+        count=len(result_files),
+    )
+
+
+def write_project_doc(args: dict, **kw) -> str:
+    """Write content to a project document file (overwrites, creates dirs).
+
+    Schema:
+        project_id (str): Project identifier
+        path (str):      File path relative to the project directory
+        content (str):   File content to write
+    """
+    project_id = args.get("project_id", "")
+    path = args.get("path", "")
+    content = args.get("content", "")
+
+    if _is_project_cancelled(project_id):
+        return _tool_failure("write_project_doc", project_id, "本轮任务已停止，拒绝继续写入项目内容。")
+
+    # Redirect user-facing Chinese stage filenames to canonical internal
+    # paths before WritePolicy checks, otherwise a correct stage write can be
+    # rejected only because the model chose the display name.
+    original_path = path
+    path = _normalize_episode_doc_path(_canonical_project_doc_path(path))
+    # ── episodes 写集门禁（A-EPISODES-WRITE-CHAIN-REDESIGN-01，2026-06-16 重构） ──
+    # 波别定：episode_contract 概念彻底删除。写集只留 2 道门：
+    #   1. 最低字数 700（低于拒写——"写出来的东西没用"，波别拍板）
+    #   2. 硬墙 1200（超拒写——防模型写飞到 2000+）
+    # 其余（missing/incomplete contract、scene_plan、os_budget、字段缺失）全删，
+    # 落盘后质量靠后置 _validate_single_episode warning 提示用户，不阻断写盘。
+    if isinstance(content, str) and path.startswith("episodes/ep"):
+        # 兼容：agent 若仍在 content 开头带 episode_contract 块，剥掉再算字数
+        content, _discarded_contract = _strip_episode_contract_block(content)
+        normalized_path_for_gate = _normalize_project_doc_trace_path(path)
+        _body_for_count = re.sub(r"```.*?```", "", content, flags=re.DOTALL)
+        _body_for_count = re.sub(r"^\s*#+\s*", "", _body_for_count, flags=re.MULTILINE)
+        _body_for_count = re.sub(
+            r"[`\s*_>#|《》「」『』【】\[\]（）()：:，,。.!！?？、；;·\-—▲△]",
+            "", _body_for_count,
+        )
+        _body_chars = len(_body_for_count)
+        if _body_chars < EPISODE_MIN_WRITE_CHARS:
+            _append_unique_trace_list("warnings",
+                f"length_under_min: {normalized_path_for_gate} "
+                f"({_body_chars} < {EPISODE_MIN_WRITE_CHARS})")
+            return _tool_failure("write_project_doc", project_id,
+                f"正文只有 {_body_chars} 字，低于最低 {EPISODE_MIN_WRITE_CHARS} 字。"
+                f"请写到 {EPISODE_MIN_WRITE_CHARS}-{EPISODE_HARD_MAX_CHARS} 字的完整剧集——"
+                f"展开核心冲突、对话和场景，不要只写提纲或占位。")
+        if _body_chars > EPISODE_HARD_MAX_CHARS:
+            _append_unique_trace_list("warnings",
+                f"length_over_hard_cap: {normalized_path_for_gate} "
+                f"({_body_chars} > hard cap {EPISODE_HARD_MAX_CHARS})")
+            return _tool_failure("write_project_doc", project_id,
+                f"正文 {_body_chars} 字，超硬上限 {EPISODE_HARD_MAX_CHARS} 字。"
+                f"请压缩到 {EPISODE_HARD_MAX_CHARS} 字以内重写——删掉冗余描写和重复对话，"
+                f"保留核心冲突和结尾钩子。")
+        # 波别要求：剧集正文严禁破折号「——」（DeepSeek 强写、SKILL/prompt 都管不住），
+        # 写盘兜底：把「——」替换成全角逗号（对白/动作的连接停顿用逗号，语义无损）。
+        content = content.replace("——", "，")
+        # 波别要求：△ 动作符号必须顶格行首，不能跟在对白后面同一行。
+        # 写盘兜底：把非行首的 △ 前插入换行，确保每个 △ 都是行首。
+        content = re.sub(r"(?<!\n)(?<=.)([ \t]*)(?=△)", "\n", content)
+    # ──────────────────────────────────────────────────────────────────
+
+    policy_error = _path_allowed_by_policy(project_id, path)
+    if policy_error:
+        return _tool_failure("write_project_doc", project_id, policy_error)
+
+    err = _check_project_id(project_id)
+    if err:
+        return _tool_failure("write_project_doc", project_id, err)
+
+    target = _resolve_project_path(project_id, path)
+    if target is None:
+        return _tool_failure("write_project_doc", project_id, f"Path traversal blocked: {path!r}")
+
+    normalized_path = target.relative_to(_PROJECTS_ROOT / project_id).as_posix()
+    policy = active_project_write_policy() or {}
+    write_mode = str(policy.get("write_mode") or "direct").strip() or "direct"
+
+    if write_mode == "collect":
+        trace = _active_methodology_trace()
+        if trace is not None:
+            pending = trace.setdefault("pending_workspace_writes", [])
+            existing = next(
+                (item for item in pending if str(item.get("path") or "") == normalized_path),
+                None,
+            )
+            payload = {
+                "path": normalized_path,
+                "content": content,
+            }
+            if existing is None:
+                pending.append(payload)
+            else:
+                existing.update(payload)
+    else:
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            return _tool_failure("write_project_doc", project_id, f"Write error: {exc}")
+        except Exception as exc:
+            return _tool_failure("write_project_doc", project_id, f"Write error: {exc}")
+
+        # A-EPISODE-NUMBER-TRUTH-SOURCE-01 §方案B：写入 episode 文件后自动更新 episode_index.json
+        if path.startswith("episodes/ep"):
+            try:
+                import re as _re_ep
+                from xiaoma.episode_index import EpisodeIndexManager as _EIM
+                ep_match = _re_ep.search(r"ep0*(\d+)\.md$", path)
+                if ep_match and project_id and _PROJECTS_ROOT is not None:
+                    _EIM((_PROJECTS_ROOT / project_id).resolve()).add_episode(int(ep_match.group(1)))
+            except Exception as _idx_exc:
+                # 索引更新失败不影响主流程，仅记录 warning
+                _append_unique_trace_list("warnings", f"episode_index_update_failed: {path}: {_idx_exc}")
+
+    _append_unique_trace_list(
+        "project_docs_written",
+        normalized_path,
+    )
+    _emit_progress("write", normalized_path)
+
+    return tool_result(
+        success=True,
+        path=normalized_path,
+        normalized_path=normalized_path,
+        original_path=original_path if original_path != path else None,
+        bytes=len(content),
+    )
+
+
+def _strip_episode_contract_block(content: str) -> tuple[str, dict | None]:
+    match = _EPISODE_CONTRACT_BLOCK_RE.match(content or "")
+    if not match:
+        # Try search relax — models sometimes prefix text before the fence
+        match = _EPISODE_CONTRACT_BLOCK_SEARCH_RE.search(content or "")
+    if not match:
+        return content, None
+    raw = (match.group(1) or "").strip()
+    if not raw:
+        return content, None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return content, None
+    if not isinstance(parsed, dict):
+        return content, None
+    stripped = content[match.end():].lstrip()
+    return stripped, parsed
+
+
+def list_ledger(args: dict, **kw) -> str:
+    """List all files in a project's ``ledger/`` directory with their content.
+
+    Schema:
+        project_id (str): Project identifier
+    """
+    project_id = args.get("project_id", "")
+
+    err = _check_project_id(project_id)
+    if err:
+        return tool_error(err)
+
+    ledger_dir = (_PROJECTS_ROOT / project_id / "ledger").resolve()
+    try:
+        ledger_dir.relative_to((_PROJECTS_ROOT / project_id).resolve())
+    except ValueError:
+        # If for some reason the resolved path escapes, block
+        return tool_error("Path traversal blocked")
+
+    if not ledger_dir.exists() or not ledger_dir.is_dir():
+        return tool_result(success=True, files=[], count=0)
+
+    files = []
+    for child in sorted(ledger_dir.iterdir()):
+        if child.is_file():
+            try:
+                child_content = child.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                child_content = f"[binary or unreadable file: {child.name}]"
+            files.append(
+                {
+                    "name": child.name,
+                    "path": str(child.relative_to(_PROJECTS_ROOT / project_id)),
+                    "content": child_content,
+                }
+            )
+
+    _append_unique_trace_list("ledger_docs_read", "ledger/")
+
+    return tool_result(success=True, files=files, count=len(files))
+
+
+def _resolve_knowledge_path(source: str) -> Optional[Path]:
+    """Resolve a knowledge file path (from index.yaml source field) to an absolute path."""
+    path = Path(source)
+    if path.is_absolute():
+        return path if path.exists() else None
+    candidates = [
+        _KNOWLEDGE_ROOT / path,
+        _STABLE_ROOT / path,
+        _STABLE_ROOT.parent / path,
+        _KNOWLEDGE_ROOT.parent / path,
+    ]
+    for c in candidates:
+        if c.exists() and c.is_file():
+            return c.resolve()
+    return None
+
+
+def retrieve_market_cards(args: dict, **kw) -> str:
+    """Retrieve approved knowledge cards with index-based retrieval and priority scoring.
+
+    Schema:
+        stage (str): inspiration | synopsis | outline | episodes | character
+        format (str): manhua | short_drama
+        topic (str): optional topic alias, e.g. xianxia, rule-horror, 宅斗
+        audience (str): optional audience filter, e.g. male, female, mixed
+        task (str): optional task filter, e.g. brainstorm, synopsis, outline, write_batch, first_episode, revise, audit
+        problem (str): optional specific problem to search for, e.g. format, hook, pacing, character, dialogue
+        max_chars (int): optional maximum returned content characters
+    """
+    stage = (args.get("stage") or "inspiration").strip()
+    fmt = (args.get("format") or "manhua").strip()
+    topic = _normalize_topic(args.get("topic") or "")
+    audience = (args.get("audience") or "").strip()
+    task = (args.get("task") or "").strip()
+    problem = (args.get("problem") or "").strip()
+    budget = int(args.get("max_chars") or _MAX_CARD_CHARS)
+    budget = max(3000, min(budget, _MAX_CARD_CHARS))
+    topic_profile = get_topic_profile(topic) if topic else None
+    allow_fixed_fallback = os.environ.get("XIAOMA_ALLOW_FIXED_RETRIEVAL_FALLBACK", "").strip() == "1"
+
+    cards = []
+    conflicts = []
+    score_reasons = []
+
+    # --- Stage 1: Index-based retrieval (A-M02) ---
+    use_methodology_index = _METHODOLOGY_INDEX_AVAILABLE
+    if use_methodology_index:
+        try:
+            index_results = query_index(
+                stage=stage,
+                topic=topic,
+                audience=audience,
+                task=task,
+                problem=problem,
+                max_results=8,
+            )
+            for ir in index_results:
+                file_path = _resolve_knowledge_path(ir["path"])
+                if file_path:
+                    full_content = file_path.read_text(encoding="utf-8").strip()
+                    if full_content:
+                        summary = _compact_card_content(full_content, budget)
+                        cards.append({
+                            "path": ir["path"],
+                            "id": ir["id"],
+                            "layer": ir["layer"],
+                            "priority": ir["priority"],
+                            "priority_order": ir.get("priority_order"),
+                            "score": ir["score"],
+                            "reason": ir["reason"],
+                            "summary": summary,
+                            "truncated": len(full_content) > len(summary),
+                        })
+                        budget -= len(summary)
+                        score_reasons.append(f"{ir['id']}: {ir['reason']}")
+                if budget <= 0:
+                    break
+
+            conflicts = conflict_check(cards)
+        except Exception as exc:
+            logger.warning("Index retrieval failed: %s", exc)
+            use_methodology_index = False
+
+    if _METHODOLOGY_INDEX_AVAILABLE and not cards and not allow_fixed_fallback:
+        return tool_error(
+            "知识索引未返回可用卡片。当前运行时已切到索引驱动主路径，"
+            "请补齐 topic-pack 子文件索引、题材 profile 或 retrieval profile，"
+            "不要再依赖固定文件 fallback。"
+        )
+
+    # --- Stage 2: Fixed-file fallback (explicitly opt-in for diagnostics only) ---
+    if not use_methodology_index:
+        if not allow_fixed_fallback:
+            return tool_error(
+                "知识索引不可用，且未开启诊断 fallback。请先修复 methodology_index 或显式设置 "
+                "XIAOMA_ALLOW_FIXED_RETRIEVAL_FALLBACK=1 做临时排查。"
+            )
+        for relative_path in _STABLE_STAGE_FILES.get(stage, _STABLE_STAGE_FILES["inspiration"]):
+            budget = _append_card(cards, _read_stable_file(relative_path), budget)
+            if budget <= 0:
+                break
+
+        for relative_path in _PROCESSED_STAGE_FILES.get(stage, _PROCESSED_STAGE_FILES["inspiration"]):
+            budget = _append_card(cards, _read_knowledge_file(_KNOWLEDGE_ROOT, relative_path), budget)
+            if budget <= 0:
+                break
+
+        for relative_path in _PATTERN_STAGE_FILES.get(stage, _PATTERN_STAGE_FILES["inspiration"]):
+            budget = _append_card(cards, _read_knowledge_file(_REDFRUIT_ROOT, relative_path), budget)
+            if budget <= 0:
+                break
+
+        for relative_path in _STAGE_FILES.get(stage, _STAGE_FILES["inspiration"]):
+            budget = _append_card(cards, _read_knowledge_file(_REDFRUIT_ROOT, relative_path), budget)
+            if budget <= 0:
+                break
+
+        if topic_profile and budget > 0:
+            topic_dir = (_TOPIC_PACKS_ROOT / topic_profile.topic_pack).resolve()
+            try:
+                topic_dir.relative_to(_TOPIC_PACKS_ROOT.resolve())
+            except ValueError:
+                topic_dir = None
+            if topic_dir and topic_dir.exists():
+                if budget > 0:
+                    for relative_path in _TOPIC_CASE_FILES.get(topic_profile.canonical_id, []):
+                        budget = _append_card(cards, _read_knowledge_file(_REDFRUIT_ROOT, relative_path), budget)
+                        if budget <= 0:
+                            break
+                if budget > 0:
+                    for filename in _TOPIC_STAGE_FILES.get(stage, _TOPIC_STAGE_FILES["inspiration"]):
+                        budget = _append_card(cards, _read_knowledge_file(topic_dir, filename), budget)
+                        if budget <= 0:
+                            break
+
+    _record_cards_retrieved(args, cards, conflicts)
+
+    return tool_result(
+        success=True,
+        stage=stage,
+        format=fmt,
+        topic=topic or None,
+        default_episode_range="80-99" if fmt in {"manhua", "ai-manhua", "AI仿真人漫剧", "漫剧"} else "按项目需求",
+        instruction=(
+            "这些卡片是趋势参考和可重组方法，不是抄袭模板。"
+            "漫剧默认按 80-99 集设计；若卡片里出现 60-80 集，以 80-99 集为当前口径。"
+            "卡片只返回摘要；需要全文时按 path 精确读取，不要反复扩大检索。"
+        ),
+        cards=cards,
+        count=len(cards),
+        score_summary=score_reasons if score_reasons else None,
+        conflicts=conflicts if conflicts else None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
+registry.register(
+    name="read_project_doc",
+    toolset="xiaoma_project",
+    schema={
+        "name": "read_project_doc",
+        "description": "Read a project document file at data/projects/{project_id}/{path}",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "Project identifier (e.g. 'proj_abc123')",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "File path relative to the project directory (e.g. 'synopsis.md')",
+                },
+            },
+            "required": ["project_id", "path"],
+        },
+    },
+    handler=read_project_doc,
+    description="Read a project document file",
+)
+
+registry.register(
+    name="list_project_docs",
+    toolset="xiaoma_project",
+    schema={
+        "name": "list_project_docs",
+        "description": "List files under a project directory, optionally with short content previews",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "Project identifier (e.g. 'proj_abc123')",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Directory or file path relative to the project directory (e.g. 'episodes/')",
+                },
+                "include_content": {
+                    "type": "boolean",
+                    "description": "Whether to include short content previews for each file",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Maximum preview characters per file, capped by the tool",
+                },
+            },
+            "required": ["project_id", "path"],
+        },
+    },
+    handler=list_project_docs,
+    description="List project files",
+)
+
+registry.register(
+    name="write_project_doc",
+    toolset="xiaoma_project",
+    schema={
+        "name": "write_project_doc",
+        "description": "Write content to a project document file (creates directories if needed, overwrites existing file)",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "Project identifier (e.g. 'proj_abc123')",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "File path relative to the project directory (e.g. 'synopsis.md')",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "File content to write",
+                },
+                "episode_contract": {
+                    "type": "object",
+                    "description": "Optional structured prewrite contract for episodes/ep*.md writes. Must include scene_plan, opening_conflict, protagonist_goal, ending_hook, target_chars_min, target_chars_max, os_budget.",
+                },
+            },
+            "required": ["project_id", "path", "content"],
+        },
+    },
+    handler=write_project_doc,
+    description="Write content to a project document file",
+)
+
+registry.register(
+    name="list_ledger",
+    toolset="xiaoma_project",
+    schema={
+        "name": "list_ledger",
+        "description": "List all files in a project's ledger/ directory with their content",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "Project identifier (e.g. 'proj_abc123')",
+                },
+            },
+            "required": ["project_id"],
+        },
+    },
+    handler=list_ledger,
+    description="List project ledger files",
+)
+
+registry.register(
+    name="retrieve_market_cards",
+    toolset="xiaoma_project",
+    schema={
+        "name": "retrieve_market_cards",
+        "description": "Retrieve approved knowledge cards with index-based retrieval and priority scoring. Use before market judgment, synopsis, outline, or episode writing. Supports stage/topic/audience/task/problem filtering.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stage": {
+                    "type": "string",
+                    "description": "Creation stage: inspiration, synopsis, outline, episodes, character",
+                },
+                "format": {
+                    "type": "string",
+                    "description": "Project format, usually manhua or short_drama",
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "Topic alias such as xianxia, rule-horror, apocalypse, female-rebirth, 修仙, 规则怪谈, 末日, 宅斗",
+                },
+                "audience": {
+                    "type": "string",
+                    "description": "Target audience filter: male, female, mixed",
+                },
+                "task": {
+                    "type": "string",
+                    "description": "Task filter: brainstorm, synopsis, character, outline, first_episode, write_batch, revise, audit",
+                },
+                "problem": {
+                    "type": "string",
+                    "description": "Specific problem to search for, e.g. format, hook, pacing, character, dialogue, rhythm, naming, compliance",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Maximum returned content characters, capped by the tool",
+                },
+            },
+            "required": ["stage"],
+        },
+    },
+    handler=retrieve_market_cards,
+    description="Retrieve approved knowledge cards with index-based retrieval",
+)
