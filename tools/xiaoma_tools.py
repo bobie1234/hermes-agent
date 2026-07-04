@@ -132,6 +132,8 @@ _CANCEL_LOCK = threading.Lock()
 # A-EXECUTE-REALTIME-PROGRESS-SSE-01：进度 hook（agent 工具调用时触发）
 # orchestrator 注册一个回调，工具调用时推进度给前端（通过 SSE）
 _PROGRESS_SINK = None
+# A-Streaming-01 打假修复：线程级当前 page（per-thread dict 隔离并发），供 _emit_artifact_commit 注入 page 字段
+_ACTIVE_PAGES_BY_THREAD: dict[int, str] = {}
 
 def set_progress_sink(callback):
     """注册进度回调（orchestrator 在跑 agent 前调）。callback(dict) → 被 orchestrator 的 SSE 推给前端。"""
@@ -141,6 +143,15 @@ def set_progress_sink(callback):
 def clear_progress_sink():
     global _PROGRESS_SINK
     _PROGRESS_SINK = None
+
+def set_active_page(page: str):
+    _ACTIVE_PAGES_BY_THREAD[threading.get_ident()] = page
+
+def clear_active_page():
+    _ACTIVE_PAGES_BY_THREAD.pop(threading.get_ident(), None)
+
+def active_page() -> str:
+    return _ACTIVE_PAGES_BY_THREAD.get(threading.get_ident(), "")
 
 def _emit_progress(action: str, path: str):
     """工具调用时触发进度信号。翻译表内置——绝不暴露 skill/tool/路径。"""
@@ -152,6 +163,41 @@ def _emit_progress(action: str, path: str):
             _PROGRESS_SINK({"progress": msg, "action": action, "path": path})
         except Exception:
             pass  # 进度推送失败不影响主流程
+
+
+def _emit_artifact_commit(project_id: str, path: str, content: str):
+    """发出 artifact_commit 事件，让前端实时更新左侧内容卡片。
+
+    在 write_project_doc 写盘成功或 collect pending 后调用。
+    """
+    if _PROGRESS_SINK is None:
+        return
+    page = active_page()
+    try:
+        _PROGRESS_SINK({
+            "type": "artifact_commit",
+            "project_id": project_id,
+            "page": page,
+            "path": path,
+            "kind": _infer_artifact_kind(path),
+            "content": content,
+        })
+    except Exception:
+        pass
+
+
+def _infer_artifact_kind(path: str) -> str:
+    if path.startswith("characters/") and path.endswith(".md") and not path.startswith("characters/00-"):
+        return "character_card"
+    if path == "ledger/inspiration_plan_options.json":
+        return "inspiration_plan"
+    if path == "outline.md":
+        return "outline_stage"
+    if path == "ledger/episode_outline.json":
+        return "episode_outline"
+    if path.startswith("episodes/ep") and path.endswith(".md"):
+        return "episode_body"
+    return "generic"
 
 def _translate_tool_to_progress(action: str, path: str) -> str:
     """工具调用 → 用户语言翻译表。核心：绝不暴露内部词。"""
@@ -1115,7 +1161,35 @@ def write_project_doc(args: dict, **kw) -> str:
                 pending.append(payload)
             else:
                 existing.update(payload)
+        _emit_artifact_commit(project_id, normalized_path, content)
     else:
+        # B-EPISODE-BACKUP-01：写入剧集文件前先备份旧版本。
+        # 检查目标文件是否存在，如果存在则复制为 .v{N} 版本文件。
+        # 版本号从 1 开始递增，保留所有历史版本供前端对比。
+        if path.startswith("episodes/ep"):
+            try:
+                if target.exists() and target.stat().st_size > 0:
+                    old_content = target.read_text(encoding="utf-8")
+                    # 扫描已有版本文件确定下一个版本号
+                    version_num = 1
+                    for sibling in target.parent.iterdir():
+                        sibling_name = sibling.name
+                        if sibling_name.startswith(target.stem) and sibling_name.endswith(".md"):
+                            v_match = re.search(r"\.v(\d+)\.md$", sibling_name)
+                            if v_match:
+                                version_num = max(version_num, int(v_match.group(1)) + 1)
+                    # 如果主文件本身也是某个版本（如 ep001.md.v2.md 格式），
+                    # 以上扫描已覆盖。此处备份前一份内容。
+                    backup_name = f"{target.stem}.v{version_num}.md"
+                    backup_path = target.parent / backup_name
+                    backup_path.write_text(old_content, encoding="utf-8")
+                    _append_unique_trace_list("warnings",
+                        f"episode_backup: {normalized_path} -> {backup_name}")
+            except Exception as _backup_exc:
+                # 备份失败不影响主流程，仅记录 warning
+                _append_unique_trace_list("warnings",
+                    f"episode_backup_failed: {normalized_path}: {_backup_exc}")
+
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
@@ -1135,6 +1209,8 @@ def write_project_doc(args: dict, **kw) -> str:
             except Exception as _idx_exc:
                 # 索引更新失败不影响主流程，仅记录 warning
                 _append_unique_trace_list("warnings", f"episode_index_update_failed: {path}: {_idx_exc}")
+
+        _emit_artifact_commit(project_id, normalized_path, content)
 
     _append_unique_trace_list(
         "project_docs_written",
