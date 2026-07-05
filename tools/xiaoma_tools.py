@@ -116,8 +116,8 @@ except ImportError:
 _MAX_CARD_CHARS = 5000
 _MAX_CARD_SUMMARY_CHARS = 900
 # 单集正文硬上限（有效字数）。大模型不会精确数数，声明低锚点也可能写飞，
-# 这道墙是代码层兜底：实际正文超过此值一律拒写、引导压缩到 900 以内。
-# 字数三档从 xiaoma.episode_quality_contract 单源 import（潘总商业剧本校准 - 2026-06-15）
+# 这道墙是代码层兜底：实际正文超过此值一律拒写、引导压缩到 600 以内。
+# 字数三档从 xiaoma.episode_quality_contract 单源 import（波别 2026-07-05 紧凑剧本口径）
 from xiaoma.episode_quality_contract import (
     EPISODE_HARD_MAX_CHARS,
     EPISODE_MIN_WRITE_CHARS,
@@ -189,8 +189,6 @@ def _emit_artifact_commit(project_id: str, path: str, content: str):
 def _infer_artifact_kind(path: str) -> str:
     if path.startswith("characters/") and path.endswith(".md") and not path.startswith("characters/00-"):
         return "character_card"
-    if path == "ledger/inspiration_plan_options.json":
-        return "inspiration_plan"
     if path == "outline.md":
         return "outline_stage"
     if path == "ledger/episode_outline.json":
