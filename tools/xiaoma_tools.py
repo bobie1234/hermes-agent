@@ -1202,10 +1202,17 @@ def write_project_doc(args: dict, **kw) -> str:
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
+            written_back = target.read_text(encoding="utf-8")
         except OSError as exc:
             return _tool_failure("write_project_doc", project_id, f"Write error: {exc}")
         except Exception as exc:
             return _tool_failure("write_project_doc", project_id, f"Write error: {exc}")
+        if written_back != content:
+            return _tool_failure(
+                "write_project_doc",
+                project_id,
+                f"Write verification failed: {normalized_path}",
+            )
 
         # A-EPISODE-NUMBER-TRUTH-SOURCE-01 §方案B：写入 episode 文件后自动更新 episode_index.json
         if path.startswith("episodes/ep"):
@@ -1233,6 +1240,7 @@ def write_project_doc(args: dict, **kw) -> str:
         normalized_path=normalized_path,
         original_path=original_path if original_path != path else None,
         bytes=len(content),
+        overwritten=True,
     )
 
 
