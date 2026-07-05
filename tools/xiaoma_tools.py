@@ -1086,6 +1086,18 @@ def write_project_doc(args: dict, **kw) -> str:
     # rejected only because the model chose the display name.
     original_path = path
     path = _normalize_episode_doc_path(_canonical_project_doc_path(path))
+    policy = active_project_write_policy() or {}
+    if (
+        str(policy.get("page") or "") == "character-biography"
+        and str(policy.get("action_intent") or "") == "preset_execute"
+        and _normalize_project_doc_trace_path(path) == "characters/00-人物关系图.md"
+    ):
+        _append_unique_trace_list("warnings", "character_relationship_map_write_blocked")
+        return _tool_failure(
+            "write_project_doc",
+            project_id,
+            "人物小传页只生成正式人物卡，不生成关系图。请继续逐个写入人物卡。",
+        )
     # ── episodes 写集门禁（A-EPISODES-WRITE-CHAIN-REDESIGN-01，2026-06-16 重构） ──
     # 波别定：episode_contract 概念彻底删除。写集只留 2 道门：
     #   1. 最低字数 700（低于拒写——"写出来的东西没用"，波别拍板）
@@ -1140,7 +1152,6 @@ def write_project_doc(args: dict, **kw) -> str:
         return _tool_failure("write_project_doc", project_id, f"Path traversal blocked: {path!r}")
 
     normalized_path = target.relative_to(_PROJECTS_ROOT / project_id).as_posix()
-    policy = active_project_write_policy() or {}
     write_mode = str(policy.get("write_mode") or "direct").strip() or "direct"
 
     if write_mode == "collect":
