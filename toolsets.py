@@ -71,7 +71,7 @@ _HERMES_CORE_TOOLS = [
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
     # Xiaoma project document tools
-    "read_project_doc", "write_project_doc", "list_project_docs", "list_ledger", "retrieve_market_cards",
+    "read_project_doc", "write_project_doc", "list_project_docs", "list_ledger", "retrieve_market_cards", "search_reference_drama",
 ]
 
 
@@ -223,7 +223,7 @@ TOOLSETS = {
 
     "xiaoma_project": {
         "description": "小马项目工具: read/write project docs, list ledger entries, and retrieve approved market cards",
-        "tools": ["read_project_doc", "write_project_doc", "list_project_docs", "list_ledger", "retrieve_market_cards"],
+        "tools": ["read_project_doc", "write_project_doc", "list_project_docs", "list_ledger", "retrieve_market_cards", "search_reference_drama"],
         "includes": []
     },
 
@@ -232,7 +232,7 @@ TOOLSETS = {
         "tools": [
             "skills_list", "skill_view",
             "read_project_doc", "write_project_doc", "list_project_docs",
-            "list_ledger", "retrieve_market_cards",
+            "list_ledger", "retrieve_market_cards", "search_reference_drama",
         ],
         "includes": []
     },

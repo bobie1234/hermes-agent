@@ -14,7 +14,10 @@ import os
 import re
 import sys
 import threading
+from html import unescape
 from pathlib import Path
+from urllib.parse import quote_plus, urlparse, parse_qs, unquote
+from urllib.request import Request, urlopen
 from typing import Optional
 
 
@@ -1323,6 +1326,23 @@ def _resolve_knowledge_path(source: str) -> Optional[Path]:
     return None
 
 
+def _read_index_card_content(file_path: Path, source: str) -> str:
+    try:
+        content = file_path.read_text(encoding="utf-8")
+        if "\ufffd" in content:
+            logger.warning("Indexed knowledge card contains replacement characters: %s", source)
+            _append_unique_trace_list("warnings", f"knowledge_card_replacement_chars: {source}")
+            content = content.replace("\ufffd", "")
+        return content.strip()
+    except UnicodeDecodeError as exc:
+        logger.warning("Indexed knowledge card is not UTF-8 readable: %s: %s", source, exc)
+        _append_unique_trace_list("warnings", f"knowledge_card_unreadable: {source}")
+    except OSError as exc:
+        logger.warning("Indexed knowledge card could not be read: %s: %s", source, exc)
+        _append_unique_trace_list("warnings", f"knowledge_card_read_failed: {source}")
+    return ""
+
+
 def retrieve_market_cards(args: dict, **kw) -> str:
     """Retrieve approved knowledge cards with index-based retrieval and priority scoring.
 
@@ -1365,7 +1385,7 @@ def retrieve_market_cards(args: dict, **kw) -> str:
             for ir in index_results:
                 file_path = _resolve_knowledge_path(ir["path"])
                 if file_path:
-                    full_content = file_path.read_text(encoding="utf-8").strip()
+                    full_content = _read_index_card_content(file_path, ir["path"])
                     if full_content:
                         summary = _compact_card_content(full_content, budget)
                         cards.append({
@@ -1458,6 +1478,110 @@ def retrieve_market_cards(args: dict, **kw) -> str:
         count=len(cards),
         score_summary=score_reasons if score_reasons else None,
         conflicts=conflicts if conflicts else None,
+    )
+
+
+def _strip_html(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", value or "")
+    text = unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _duckduckgo_search(query: str, limit: int) -> list[dict]:
+    url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        },
+    )
+    with urlopen(req, timeout=8) as response:
+        html = response.read().decode("utf-8", errors="ignore")
+
+    results: list[dict] = []
+    pattern = re.compile(
+        r'<a[^>]+class="result__a"[^>]+href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>.*?'
+        r'<a[^>]+class="result__snippet"[^>]*>(?P<snippet>.*?)</a>',
+        re.DOTALL,
+    )
+    for match in pattern.finditer(html):
+        href = unescape(match.group("href"))
+        parsed = urlparse(href)
+        if parsed.path.endswith("/l/"):
+            href = unquote(parse_qs(parsed.query).get("uddg", [href])[0])
+        title = _strip_html(match.group("title"))
+        snippet = _strip_html(match.group("snippet"))
+        if not title:
+            continue
+        results.append({"title": title, "url": href, "snippet": snippet})
+        if len(results) >= limit:
+            break
+    return results
+
+
+def search_reference_drama(args: dict, **kw) -> str:
+    """Search reference drama information from approved knowledge first, then web."""
+    query = str(args.get("query") or "").strip()
+    if not query:
+        return tool_error("query is required")
+    limit = max(1, min(int(args.get("limit") or 5), 8))
+
+    knowledge_matches: list[dict] = []
+    index_path = (_REDFRUIT_ROOT / "blockbuster-cases" / "index.md").resolve()
+    if index_path.exists():
+        try:
+            for line in index_path.read_text(encoding="utf-8").splitlines():
+                if "|" not in line or query not in line:
+                    continue
+                cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+                if len(cells) < 5 or cells[0] in {"编号", "------"}:
+                    continue
+                knowledge_matches.append({
+                    "id": cells[0],
+                    "title": cells[1],
+                    "heat": cells[2],
+                    "episodes": cells[3],
+                    "tags": cells[4],
+                    "source": "knowledge",
+                })
+                if len(knowledge_matches) >= limit:
+                    break
+        except OSError:
+            knowledge_matches = []
+
+    web_results: list[dict] = []
+    try:
+        from tools.web_tools import web_search_tool
+        raw = web_search_tool(f"{query} 短剧 漫剧 热度 集数 剧情", limit=limit)
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(parsed, dict) and parsed.get("success") is True:
+            web_data = parsed.get("data", {}).get("web", [])
+            for entry in web_data:
+                web_results.append({
+                    "title": str(entry.get("title", "")),
+                    "url": str(entry.get("url", "")),
+                    "snippet": str(entry.get("description", "")),
+                    "source": "web",
+                })
+        if not web_results:
+            raise RuntimeError("web_search_tool returned no results")
+    except Exception as exc:
+        _append_unique_trace_list("warnings", f"reference_drama_web_search_failed: {exc}")
+        try:
+            web_results = _duckduckgo_search(f"{query} 短剧 漫剧 热度 集数 剧情", limit)
+        except Exception:
+            pass
+
+    return tool_result(
+        success=True,
+        query=query,
+        instruction=(
+            "先使用 knowledge_results；web_results 只做公开信息补充。"
+            "这些信息只能参考热度、题材、受众和卖点，不得复刻原剧剧情、人物、台词或核心桥段。"
+        ),
+        knowledge_results=knowledge_matches,
+        web_results=web_results,
+        count=len(knowledge_matches) + len(web_results),
     )
 
 
@@ -1620,4 +1744,23 @@ registry.register(
     },
     handler=retrieve_market_cards,
     description="Retrieve approved knowledge cards with index-based retrieval",
+)
+
+registry.register(
+    name="search_reference_drama",
+    toolset="xiaoma_project",
+    schema={
+        "name": "search_reference_drama",
+        "description": "Search a reference drama by name. Looks in approved knowledge first, then public web search for title, heat, episode count, tags, and summaries.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Drama title or keywords"},
+                "limit": {"type": "integer", "description": "Maximum results, 1-8"},
+            },
+            "required": ["query"],
+        },
+    },
+    handler=search_reference_drama,
+    description="Search reference drama information from knowledge and web",
 )
