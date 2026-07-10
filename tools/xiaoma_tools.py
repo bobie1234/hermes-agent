@@ -19,7 +19,12 @@ from pathlib import Path
 from urllib.parse import quote_plus, urlparse, parse_qs, unquote
 from urllib.request import Request, urlopen
 from typing import Optional
+from datetime import datetime, timezone
 
+from packages.artifact_canonicalization import (
+    CanonicalizationContext,
+    canonicalize_artifact_content,
+)
 from packages.artifact_contract import ArtifactManifest
 
 
@@ -178,6 +183,31 @@ def _build_artifact_manifest(
         kind=kind,
         content=content,
     )
+
+
+def _hermes_canonicalization_context(project_id: str) -> CanonicalizationContext:
+    """Build a CanonicalizationContext backed by Hermes ``_resolve_project_path``.
+
+    Hermes can read local project files during collect, so the normalizer
+    can fill in ``base_content_hash`` / ``old_content`` from the actual
+    episode files on disk.
+    """
+
+    def _read_file(path: str) -> str:
+        resolved = _resolve_project_path(project_id, path)
+        if resolved is None or not resolved.exists():
+            raise FileNotFoundError(f"episode file not found: {path}")
+        return resolved.read_text(encoding="utf-8")
+
+    def _resolve_file(path: str) -> Optional[str]:
+        resolved = _resolve_project_path(project_id, path)
+        return str(resolved) if resolved is not None else None
+
+    return CanonicalizationContext(
+        read_file_content=_read_file,
+        resolve_file_path=_resolve_file,
+    )
+
 
 def set_progress_sink(callback):
     """注册进度回调（orchestrator 在跑 agent 前调）。callback(dict) → 被 orchestrator 的 SSE 推给前端。"""
@@ -1304,6 +1334,22 @@ def write_project_doc(args: dict, **kw) -> str:
                 project_id,
                 "collect 模式缺少 run_id，无法发出正式 artifact 事件。",
             )
+
+        # Canonicalize content before creating manifest so that
+        # content_hash/bytes reflect the canonical (written) content.
+        # on-the-fly normalization would produce a different content
+        # hash at commit time.  The sidecar's artifact executor no
+        # longer rehashes — it trusts the manifest computed here.
+        _canonical_content = canonicalize_artifact_content(
+            project_id=project_id,
+            path=normalized_path,
+            content=content,
+            workspace_context=_hermes_canonicalization_context(project_id),
+            now_iso=datetime.now(timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z"),
+        )
+
         _seq = _next_artifact_sequence()
         try:
             _manifest = _build_artifact_manifest(
@@ -1313,7 +1359,7 @@ def write_project_doc(args: dict, **kw) -> str:
                 page=active_page(),
                 path=normalized_path,
                 kind=_infer_artifact_kind(path),
-                content=content,
+                content=_canonical_content,
             )
         except ValueError as exc:
             return _tool_failure("write_project_doc", project_id, f"invalid artifact manifest: {exc}")
@@ -1323,12 +1369,12 @@ def write_project_doc(args: dict, **kw) -> str:
                 (item for item in pending if str(item.get("path") or "") == normalized_path),
                 None,
             )
-            payload = _manifest.to_pending_write(content)
+            payload = _manifest.to_pending_write(_canonical_content)
             if existing is None:
                 pending.append(payload)
             else:
                 existing.update(payload)
-        _emit_artifact_ready(project_id, normalized_path, content, manifest=_manifest)
+        _emit_artifact_ready(project_id, normalized_path, _canonical_content, manifest=_manifest)
     else:
         # B-EPISODE-BACKUP-01：写入剧集文件前先备份旧版本。
         # 检查目标文件是否存在，如果存在则复制为 .v{N} 版本文件。
