@@ -355,6 +355,7 @@ def start_methodology_trace(
 ) -> None:
     """Start a per-thread methodology trace for one Hermes run."""
     _reset_artifact_sequence()
+    set_active_page(page)
     _METHODOLOGY_TRACES_BY_THREAD[threading.get_ident()] = {
         "run_id": run_id,
         "project_id": project_id,
@@ -1294,19 +1295,28 @@ def write_project_doc(args: dict, **kw) -> str:
     normalized_path = target.relative_to(_PROJECTS_ROOT / project_id).as_posix()
     write_mode = str(policy.get("write_mode") or "direct").strip() or "direct"
     trace = _active_methodology_trace()
+    run_id = str(trace.get("run_id") or "") if trace else ""
 
     if write_mode == "collect":
-        run_id = str(trace.get("run_id") or "") if trace else ""
+        if not run_id:
+            return _tool_failure(
+                "write_project_doc",
+                project_id,
+                "collect 模式缺少 run_id，无法发出正式 artifact 事件。",
+            )
         _seq = _next_artifact_sequence()
-        _manifest = _build_artifact_manifest(
-            run_id=run_id,
-            sequence=_seq,
-            project_id=project_id,
-            page=active_page(),
-            path=normalized_path,
-            kind=_infer_artifact_kind(path),
-            content=content,
-        )
+        try:
+            _manifest = _build_artifact_manifest(
+                run_id=run_id,
+                sequence=_seq,
+                project_id=project_id,
+                page=active_page(),
+                path=normalized_path,
+                kind=_infer_artifact_kind(path),
+                content=content,
+            )
+        except ValueError as exc:
+            return _tool_failure("write_project_doc", project_id, f"invalid artifact manifest: {exc}")
         if trace is not None:
             pending = trace.setdefault("pending_workspace_writes", [])
             existing = next(
@@ -1375,18 +1385,21 @@ def write_project_doc(args: dict, **kw) -> str:
                 _append_unique_trace_list("warnings", f"episode_index_update_failed: {path}: {_idx_exc}")
 
         # Direct write mode — construct manifest ONCE for the commit event
-        run_id = str(trace.get("run_id") or "") if trace else ""
-        _dseq = _next_artifact_sequence()
-        _direct_manifest = _build_artifact_manifest(
-            run_id=run_id,
-            sequence=_dseq,
-            project_id=project_id,
-            page=active_page(),
-            path=normalized_path,
-            kind=_infer_artifact_kind(path),
-            content=content,
-        )
-        _emit_artifact_commit(project_id, normalized_path, content, manifest=_direct_manifest)
+        if run_id:
+            _dseq = _next_artifact_sequence()
+            try:
+                _direct_manifest = _build_artifact_manifest(
+                    run_id=run_id,
+                    sequence=_dseq,
+                    project_id=project_id,
+                    page=active_page(),
+                    path=normalized_path,
+                    kind=_infer_artifact_kind(path),
+                    content=content,
+                )
+            except ValueError as exc:
+                return _tool_failure("write_project_doc", project_id, f"invalid artifact manifest: {exc}")
+            _emit_artifact_commit(project_id, normalized_path, content, manifest=_direct_manifest)
 
     _append_unique_trace_list(
         "project_docs_written",
