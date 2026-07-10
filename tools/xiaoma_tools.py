@@ -137,6 +137,27 @@ _CANCEL_LOCK = threading.Lock()
 _PROGRESS_SINK = None
 # A-Streaming-01 打假修复：线程级当前 page（per-thread dict 隔离并发），供 _emit_artifact_event 注入 page 字段
 _ACTIVE_PAGES_BY_THREAD: dict[int, str] = {}
+# Per-thread artifact sequence counter for identity allocation.
+_ARTIFACT_SEQUENCE_BY_THREAD: dict[int, int] = {}
+
+
+def _next_artifact_sequence() -> int:
+    """Allocate the next per-thread artifact sequence number."""
+    tid = threading.get_ident()
+    seq = _ARTIFACT_SEQUENCE_BY_THREAD.get(tid, 0) + 1
+    _ARTIFACT_SEQUENCE_BY_THREAD[tid] = seq
+    return seq
+
+
+def _reset_artifact_sequence() -> None:
+    """Reset the artifact sequence counter for the current thread."""
+    _ARTIFACT_SEQUENCE_BY_THREAD.pop(threading.get_ident(), None)
+
+
+def _artifact_content_hash(content: str) -> str:
+    """SHA-256 prefix for content identity."""
+    import hashlib
+    return hashlib.sha256((content or "").encode("utf-8")).hexdigest()[:16]
 
 def set_progress_sink(callback):
     """注册进度回调（orchestrator 在跑 agent 前调）。callback(dict) → 被 orchestrator 的 SSE 推给前端。"""
@@ -186,24 +207,42 @@ def _emit_artifact_ready(project_id: str, path: str, content: str):
 
 
 def _emit_artifact_event(event_type: str, project_id: str, path: str, content: str):
-    """统一发出 artifact 事件。"""
+    """统一发出 artifact 事件，包含完整 envelope 字段。
+
+    所有生命周期事件（artifact_ready / artifact_commit / artifact_failed）
+    和展示事件（artifact_start / artifact_delta / artifact_replace）
+    都必须携带 schema_version / run_id / artifact_id / sequence 等身份字段，
+    使 producer（Hermes）→ transport → sidecar → frontend 四层能关联同一产物。
+    """
     if _PROGRESS_SINK is None:
         return
     page = active_page()
+    trace = _active_methodology_trace() or {}
+    run_id = str(trace.get("run_id") or "")
+    sequence = _next_artifact_sequence()
+    artifact_id = f"art-{run_id}-{sequence}" if run_id else f"art-local-{sequence}"
+    content_bytes = len((content or "").encode("utf-8"))
     try:
         _PROGRESS_SINK({
+            "schema_version": 1,
             "type": event_type,
+            "run_id": run_id,
+            "artifact_id": artifact_id,
+            "sequence": sequence,
             "project_id": project_id,
             "page": page,
             "path": path,
             "kind": _infer_artifact_kind(path),
             "content": content,
+            "content_hash": _artifact_content_hash(content),
+            "bytes": content_bytes,
         })
     except Exception:
         pass
 
 
 def _infer_artifact_kind(path: str) -> str:
+    # New format: characters/01.md
     if path.startswith("characters/") and path.endswith(".md") and not path.startswith("characters/00-"):
         return "character_card"
     if path == "outline.md":
@@ -271,6 +310,7 @@ def start_methodology_trace(
     expected_skills: list[str] | None = None,
 ) -> None:
     """Start a per-thread methodology trace for one Hermes run."""
+    _reset_artifact_sequence()
     _METHODOLOGY_TRACES_BY_THREAD[threading.get_ident()] = {
         "run_id": run_id,
         "project_id": project_id,
@@ -1150,6 +1190,10 @@ def write_project_doc(args: dict, **kw) -> str:
             if _rejected_write_mode == "collect":
                 trace = _active_methodology_trace()
                 if trace is not None:
+                    run_id = str(trace.get("run_id") or "")
+                    _seq = _next_artifact_sequence()
+                    _art_id = f"art-{run_id}-{_seq}" if run_id else f"art-local-{_seq}"
+                    _chash = _artifact_content_hash(content)
                     pending = trace.setdefault("pending_workspace_writes", [])
                     existing = next(
                         (item for item in pending if str(item.get("path") or "") == normalized_path_for_gate),
@@ -1159,6 +1203,13 @@ def write_project_doc(args: dict, **kw) -> str:
                         "path": normalized_path_for_gate,
                         "content": content,
                         "word_count_failed": True,
+                        "schema_version": 1,
+                        "run_id": run_id,
+                        "artifact_id": _art_id,
+                        "sequence": _seq,
+                        "content_hash": _chash,
+                        "bytes": len(content.encode("utf-8")),
+                        "kind": "episode_body",
                     }
                     if existing is None:
                         pending.append(payload)
@@ -1206,6 +1257,10 @@ def write_project_doc(args: dict, **kw) -> str:
     if write_mode == "collect":
         trace = _active_methodology_trace()
         if trace is not None:
+            run_id = str(trace.get("run_id") or "")
+            _seq = _next_artifact_sequence()
+            _art_id = f"art-{run_id}-{_seq}" if run_id else f"art-local-{_seq}"
+            _chash = _artifact_content_hash(content)
             pending = trace.setdefault("pending_workspace_writes", [])
             existing = next(
                 (item for item in pending if str(item.get("path") or "") == normalized_path),
@@ -1214,6 +1269,13 @@ def write_project_doc(args: dict, **kw) -> str:
             payload = {
                 "path": normalized_path,
                 "content": content,
+                "schema_version": 1,
+                "run_id": run_id,
+                "artifact_id": _art_id,
+                "sequence": _seq,
+                "content_hash": _chash,
+                "bytes": len(content.encode("utf-8")),
+                "kind": _infer_artifact_kind(path),
             }
             if existing is None:
                 pending.append(payload)
