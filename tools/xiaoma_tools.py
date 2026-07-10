@@ -189,54 +189,58 @@ def _emit_progress(action: str, path: str):
             pass  # 进度推送失败不影响主流程
 
 
-def _emit_artifact_commit(project_id: str, path: str, content: str):
-    """发出 artifact_commit 事件，让前端实时更新左侧内容卡片。
-
-    只在 write_project_doc 真实写盘并 readback 成功后调用。
-    """
-    _emit_artifact_event("artifact_commit", project_id, path, content)
+def _emit_artifact_commit(project_id: str, path: str, content: str, *, manifest: dict | None = None):
+    """发出 artifact_commit 事件。直接写盘模式下调用。manifest 由写盘逻辑一次性构造。"""
+    _emit_artifact_event("artifact_commit", project_id, path, content, manifest=manifest)
 
 
-def _emit_artifact_ready(project_id: str, path: str, content: str):
-    """发出 artifact_ready 事件，表示模型已生成产物但尚未落盘。
-
-    在 collect 模式下调用：内容只进入 pending_workspace_writes，
-    等待 sidecar verified apply 后才会变为 artifact_commit。
-    """
-    _emit_artifact_event("artifact_ready", project_id, path, content)
+def _emit_artifact_ready(project_id: str, path: str, content: str, *, manifest: dict | None = None):
+    """发出 artifact_ready 事件。collect 模式下调用。manifest 由 collect 逻辑一次性构造。"""
+    _emit_artifact_event("artifact_ready", project_id, path, content, manifest=manifest)
 
 
-def _emit_artifact_event(event_type: str, project_id: str, path: str, content: str):
-    """统一发出 artifact 事件，包含完整 envelope 字段。
+def _emit_artifact_event(event_type: str, project_id: str, path: str, content: str, *, manifest: dict | None = None):
+    """统一发出 artifact 事件。
 
-    所有生命周期事件（artifact_ready / artifact_commit / artifact_failed）
-    和展示事件（artifact_start / artifact_delta / artifact_replace）
-    都必须携带 schema_version / run_id / artifact_id / sequence 等身份字段，
-    使 producer（Hermes）→ transport → sidecar → frontend 四层能关联同一产物。
+    identity 字段由调用方通过 ``manifest`` 一次性传入，本函数不再自行分配
+    sequence / artifact_id / content_hash。``manifest`` 缺失时仅用于 display
+    事件（start/delta/replace），lifecycle 事件（ready/commit/failed）必须
+    携带完整 manifest，否则不发送。
     """
     if _PROGRESS_SINK is None:
         return
     page = active_page()
-    trace = _active_methodology_trace() or {}
-    run_id = str(trace.get("run_id") or "")
-    sequence = _next_artifact_sequence()
-    artifact_id = f"art-{run_id}-{sequence}" if run_id else f"art-local-{sequence}"
-    content_bytes = len((content or "").encode("utf-8"))
-    try:
-        _PROGRESS_SINK({
+
+    # Display events can run without manifest; lifecycle events MUST have one
+    is_lifecycle = event_type in {"artifact_ready", "artifact_commit", "artifact_failed"}
+    if is_lifecycle and manifest is None:
+        # Lifecycle event without manifest — protocol violation, do not send
+        return
+
+    # Build event from manifest when available
+    event: dict = {"type": event_type}
+    if manifest is not None:
+        event.update(manifest)
+        # Overwrite event type (manifest has no 'type' field)
+        event["type"] = event_type
+    else:
+        # Display event — minimal identity from trace for association
+        trace = _active_methodology_trace() or {}
+        run_id = str(trace.get("run_id") or "")
+        seq = _next_artifact_sequence()
+        event.update({
             "schema_version": 1,
-            "type": event_type,
             "run_id": run_id,
-            "artifact_id": artifact_id,
-            "sequence": sequence,
-            "project_id": project_id,
-            "page": page,
-            "path": path,
-            "kind": _infer_artifact_kind(path),
-            "content": content,
-            "content_hash": _artifact_content_hash(content),
-            "bytes": content_bytes,
+            "artifact_id": f"art-{run_id}-{seq}" if run_id else f"art-local-{seq}",
+            "sequence": seq,
         })
+
+    # Always inject page and content (manifest has page but not content)
+    event["page"] = page
+    event["content"] = content
+
+    try:
+        _PROGRESS_SINK(event)
     except Exception:
         pass
 
@@ -1193,7 +1197,21 @@ def write_project_doc(args: dict, **kw) -> str:
                     run_id = str(trace.get("run_id") or "")
                     _seq = _next_artifact_sequence()
                     _art_id = f"art-{run_id}-{_seq}" if run_id else f"art-local-{_seq}"
+                    _kind = "episode_body"
                     _chash = _artifact_content_hash(content)
+                    _content_bytes = len(content.encode("utf-8"))
+                    _rej_manifest = {
+                        "schema_version": 1,
+                        "run_id": run_id,
+                        "artifact_id": _art_id,
+                        "sequence": _seq,
+                        "project_id": project_id,
+                        "page": active_page(),
+                        "path": normalized_path_for_gate,
+                        "kind": _kind,
+                        "content_hash": _chash,
+                        "bytes": _content_bytes,
+                    }
                     pending = trace.setdefault("pending_workspace_writes", [])
                     existing = next(
                         (item for item in pending if str(item.get("path") or "") == normalized_path_for_gate),
@@ -1203,13 +1221,7 @@ def write_project_doc(args: dict, **kw) -> str:
                         "path": normalized_path_for_gate,
                         "content": content,
                         "word_count_failed": True,
-                        "schema_version": 1,
-                        "run_id": run_id,
-                        "artifact_id": _art_id,
-                        "sequence": _seq,
-                        "content_hash": _chash,
-                        "bytes": len(content.encode("utf-8")),
-                        "kind": "episode_body",
+                        **_rej_manifest,
                     }
                     if existing is None:
                         pending.append(payload)
@@ -1260,7 +1272,22 @@ def write_project_doc(args: dict, **kw) -> str:
             run_id = str(trace.get("run_id") or "")
             _seq = _next_artifact_sequence()
             _art_id = f"art-{run_id}-{_seq}" if run_id else f"art-local-{_seq}"
+            _kind = _infer_artifact_kind(path)
             _chash = _artifact_content_hash(content)
+            _content_bytes = len(content.encode("utf-8"))
+            # Construct manifest ONCE — used by both pending and ready event
+            _manifest = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "artifact_id": _art_id,
+                "sequence": _seq,
+                "project_id": project_id,
+                "page": active_page(),
+                "path": normalized_path,
+                "kind": _kind,
+                "content_hash": _chash,
+                "bytes": _content_bytes,
+            }
             pending = trace.setdefault("pending_workspace_writes", [])
             existing = next(
                 (item for item in pending if str(item.get("path") or "") == normalized_path),
@@ -1269,19 +1296,13 @@ def write_project_doc(args: dict, **kw) -> str:
             payload = {
                 "path": normalized_path,
                 "content": content,
-                "schema_version": 1,
-                "run_id": run_id,
-                "artifact_id": _art_id,
-                "sequence": _seq,
-                "content_hash": _chash,
-                "bytes": len(content.encode("utf-8")),
-                "kind": _infer_artifact_kind(path),
+                **_manifest,
             }
             if existing is None:
                 pending.append(payload)
             else:
                 existing.update(payload)
-        _emit_artifact_ready(project_id, normalized_path, content)
+        _emit_artifact_ready(project_id, normalized_path, content, manifest=_manifest)
     else:
         # B-EPISODE-BACKUP-01：写入剧集文件前先备份旧版本。
         # 检查目标文件是否存在，如果存在则复制为 .v{N} 版本文件。
@@ -1337,7 +1358,24 @@ def write_project_doc(args: dict, **kw) -> str:
                 # 索引更新失败不影响主流程，仅记录 warning
                 _append_unique_trace_list("warnings", f"episode_index_update_failed: {path}: {_idx_exc}")
 
-        _emit_artifact_commit(project_id, normalized_path, content)
+        # Direct write mode — construct manifest ONCE for the commit event
+        run_id = str((trace or {}).get("run_id") or "") if trace else ""
+        _dseq = _next_artifact_sequence()
+        _dart_id = f"art-{run_id}-{_dseq}" if run_id else f"art-local-{_dseq}"
+        _dchash = _artifact_content_hash(content)
+        _direct_manifest = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "artifact_id": _dart_id,
+            "sequence": _dseq,
+            "project_id": project_id,
+            "page": active_page(),
+            "path": normalized_path,
+            "kind": _infer_artifact_kind(path),
+            "content_hash": _dchash,
+            "bytes": len(content.encode("utf-8")),
+        }
+        _emit_artifact_commit(project_id, normalized_path, content, manifest=_direct_manifest)
 
     _append_unique_trace_list(
         "project_docs_written",
