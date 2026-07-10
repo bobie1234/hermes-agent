@@ -135,7 +135,7 @@ _CANCEL_LOCK = threading.Lock()
 # A-EXECUTE-REALTIME-PROGRESS-SSE-01：进度 hook（agent 工具调用时触发）
 # orchestrator 注册一个回调，工具调用时推进度给前端（通过 SSE）
 _PROGRESS_SINK = None
-# A-Streaming-01 打假修复：线程级当前 page（per-thread dict 隔离并发），供 _emit_artifact_commit 注入 page 字段
+# A-Streaming-01 打假修复：线程级当前 page（per-thread dict 隔离并发），供 _emit_artifact_event 注入 page 字段
 _ACTIVE_PAGES_BY_THREAD: dict[int, str] = {}
 
 def set_progress_sink(callback):
@@ -171,14 +171,28 @@ def _emit_progress(action: str, path: str):
 def _emit_artifact_commit(project_id: str, path: str, content: str):
     """发出 artifact_commit 事件，让前端实时更新左侧内容卡片。
 
-    在 write_project_doc 写盘成功或 collect pending 后调用。
+    只在 write_project_doc 真实写盘并 readback 成功后调用。
     """
+    _emit_artifact_event("artifact_commit", project_id, path, content)
+
+
+def _emit_artifact_ready(project_id: str, path: str, content: str):
+    """发出 artifact_ready 事件，表示模型已生成产物但尚未落盘。
+
+    在 collect 模式下调用：内容只进入 pending_workspace_writes，
+    等待 sidecar verified apply 后才会变为 artifact_commit。
+    """
+    _emit_artifact_event("artifact_ready", project_id, path, content)
+
+
+def _emit_artifact_event(event_type: str, project_id: str, path: str, content: str):
+    """统一发出 artifact 事件。"""
     if _PROGRESS_SINK is None:
         return
     page = active_page()
     try:
         _PROGRESS_SINK({
-            "type": "artifact_commit",
+            "type": event_type,
             "project_id": project_id,
             "page": page,
             "path": path,
@@ -1205,7 +1219,7 @@ def write_project_doc(args: dict, **kw) -> str:
                 pending.append(payload)
             else:
                 existing.update(payload)
-        _emit_artifact_commit(project_id, normalized_path, content)
+        _emit_artifact_ready(project_id, normalized_path, content)
     else:
         # B-EPISODE-BACKUP-01：写入剧集文件前先备份旧版本。
         # 检查目标文件是否存在，如果存在则复制为 .v{N} 版本文件。
