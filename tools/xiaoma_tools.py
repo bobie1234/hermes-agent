@@ -319,8 +319,14 @@ def _tool_failure(tool_name: str, project_id: str, message: str) -> str:
     if count > STOP_LOSS_FAILURE_LIMIT:
         _append_unique_trace_list(
             "warnings",
-            f"tool_failure_stop_loss: {tool_name} failed {count}/{STOP_LOSS_FAILURE_LIMIT} times (single-file stop, run preserved)",
+f"tool_failure_stop_loss: {tool_name} failed {count}/{STOP_LOSS_FAILURE_LIMIT} times (single-file stop, run preserved)",
         )
+        trace["tool_hard_stop"] = {
+            "tool": tool_name,
+            "reason": "stop_loss",
+        }
+        trace["failure_stage"] = "write_stop_loss"
+        trace["completion_reached"] = False
         return tool_error(
             f"该文件已连续写入失败 {STOP_LOSS_FAILURE_LIMIT} 次，停止重试此文件。"
             "其他文件不受影响，请精简内容或点「检查问题」后重试本文件。"
@@ -1084,6 +1090,11 @@ def write_project_doc(args: dict, **kw) -> str:
     if _is_project_cancelled(project_id):
         return _tool_failure("write_project_doc", project_id, "本轮任务已停止，拒绝继续写入项目内容。")
 
+    trace = _active_methodology_trace()
+    hard_stop = trace.get("tool_hard_stop") if isinstance(trace, dict) else None
+    if isinstance(hard_stop, dict) and hard_stop.get("tool") == "write_project_doc" and hard_stop.get("reason") == "stop_loss":
+        return tool_error("该文件已停止重试，拒绝继续写入项目内容。请精简内容或点「检查问题」后重试本文件。")
+
     # Redirect user-facing Chinese stage filenames to canonical internal
     # paths before WritePolicy checks, otherwise a correct stage write can be
     # rejected only because the model chose the display name.
@@ -1101,12 +1112,13 @@ def write_project_doc(args: dict, **kw) -> str:
             project_id,
             "人物小传页只生成正式人物卡，不生成关系图。请继续逐个写入人物卡。",
         )
-    # ── episodes 写集门禁（A-EPISODES-WRITE-CHAIN-REDESIGN-01，2026-06-16 重构） ──
-    # 波别定：episode_contract 概念彻底删除。写集只留 2 道门：
-    #   1. 最低字数 700（低于拒写——"写出来的东西没用"，波别拍板）
-    #   2. 硬墙 1200（超拒写——防模型写飞到 2000+）
-    # 其余（missing/incomplete contract、scene_plan、os_budget、字段缺失）全删，
-    # 落盘后质量靠后置 _validate_single_episode warning 提示用户，不阻断写盘。
+    # ── episodes 写集门禁 ──
+    # 字数三档从 xiaoma.episode_quality_contract 单源 import：
+    #   MIN_EPISODE_CHARS=500, MAX_EPISODE_CHARS=600, EPISODE_HARD_MAX_CHARS=700,
+    #   EPISODE_MIN_WRITE_CHARS=400
+    # 低于 EPISODE_MIN_WRITE_CHARS 拒写，超过 EPISODE_HARD_MAX_CHARS 拒写。
+    # 拒写时仍将 rejected draft 存入 pending_workspace_writes（collect 模式），
+    # 供 orchestrator 定向修订使用。不写盘（仅保留在 trace 中）。
     if isinstance(content, str) and path.startswith("episodes/ep"):
         # 兼容：agent 若仍在 content 开头带 episode_contract 块，剥掉再算字数
         content, _discarded_contract = _strip_episode_contract_block(content)
@@ -1118,22 +1130,42 @@ def write_project_doc(args: dict, **kw) -> str:
             "", _body_for_count,
         )
         _body_chars = len(_body_for_count)
-        if _body_chars < EPISODE_MIN_WRITE_CHARS:
-            _append_unique_trace_list("warnings",
-                f"length_under_min: {normalized_path_for_gate} "
-                f"({_body_chars} < {EPISODE_MIN_WRITE_CHARS})")
-            return _tool_failure("write_project_doc", project_id,
-                f"正文只有 {_body_chars} 字，低于最低 {EPISODE_MIN_WRITE_CHARS} 字。"
-                f"请写到 {EPISODE_MIN_WRITE_CHARS}-{EPISODE_HARD_MAX_CHARS} 字的完整剧集——"
-                f"展开核心冲突、对话和场景，不要只写提纲或占位。")
-        if _body_chars > EPISODE_HARD_MAX_CHARS:
-            _append_unique_trace_list("warnings",
-                f"length_over_hard_cap: {normalized_path_for_gate} "
-                f"({_body_chars} > hard cap {EPISODE_HARD_MAX_CHARS})")
-            return _tool_failure("write_project_doc", project_id,
-                f"正文 {_body_chars} 字，超硬上限 {EPISODE_HARD_MAX_CHARS} 字。"
-                f"请压缩到 {EPISODE_HARD_MAX_CHARS} 字以内重写——删掉冗余描写和重复对话，"
-                f"保留核心冲突和结尾钩子。")
+        if _body_chars < EPISODE_MIN_WRITE_CHARS or _body_chars > EPISODE_HARD_MAX_CHARS:
+            # Store rejected draft for targeted revision before failing.
+            _rejected_write_mode = str(policy.get("write_mode") or "direct").strip()
+            if _rejected_write_mode == "collect":
+                trace = _active_methodology_trace()
+                if trace is not None:
+                    pending = trace.setdefault("pending_workspace_writes", [])
+                    existing = next(
+                        (item for item in pending if str(item.get("path") or "") == normalized_path_for_gate),
+                        None,
+                    )
+                    payload = {
+                        "path": normalized_path_for_gate,
+                        "content": content,
+                        "word_count_failed": True,
+                    }
+                    if existing is None:
+                        pending.append(payload)
+                    else:
+                        existing.update(payload)
+            if _body_chars < EPISODE_MIN_WRITE_CHARS:
+                _append_unique_trace_list("warnings",
+                    f"length_under_min: {normalized_path_for_gate} "
+                    f"({_body_chars} < {EPISODE_MIN_WRITE_CHARS})")
+                return _tool_failure("write_project_doc", project_id,
+                    f"正文只有 {_body_chars} 字，低于最低 {EPISODE_MIN_WRITE_CHARS} 字。"
+                    f"请写到 {EPISODE_MIN_WRITE_CHARS}-{EPISODE_HARD_MAX_CHARS} 字的完整剧集——"
+                    f"展开核心冲突、对话和场景，不要只写提纲或占位。")
+            if _body_chars > EPISODE_HARD_MAX_CHARS:
+                _append_unique_trace_list("warnings",
+                    f"length_over_hard_cap: {normalized_path_for_gate} "
+                    f"({_body_chars} > hard cap {EPISODE_HARD_MAX_CHARS})")
+                return _tool_failure("write_project_doc", project_id,
+                    f"正文 {_body_chars} 字，超硬上限 {EPISODE_HARD_MAX_CHARS} 字。"
+                    f"请压缩到 {EPISODE_HARD_MAX_CHARS} 字以内重写——删掉冗余描写和重复对话，"
+                    f"保留核心冲突和结尾钩子。")
         # 波别要求：剧集正文严禁破折号「——」（DeepSeek 强写、SKILL/prompt 都管不住），
         # 写盘兜底：把「——」替换成全角逗号（对白/动作的连接停顿用逗号，语义无损）。
         content = content.replace("——", "，")
