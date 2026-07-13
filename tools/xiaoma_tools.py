@@ -125,12 +125,7 @@ except ImportError:
 
 _MAX_CARD_CHARS = 5000
 _MAX_CARD_SUMMARY_CHARS = 900
-# 单集正文硬上限（有效字数）。大模型不会精确数数，声明低锚点也可能写飞，
-# 这道墙是代码层兜底：实际正文超过此值一律拒写、引导压缩到 600 以内。
-# 字数三档从 xiaoma.episode_quality_contract 单源 import（波别 2026-07-05 紧凑剧本口径）
 from xiaoma.episode_quality_contract import (
-    EPISODE_HARD_MAX_CHARS,
-    EPISODE_MIN_WRITE_CHARS,
     MIN_EPISODE_CHARS,
     MAX_EPISODE_CHARS,
 )
@@ -316,14 +311,15 @@ def _emit_artifact_event(
 
 
 def _infer_artifact_kind(path: str) -> str:
+    normalized = str(path or "").replace("\\", "/").strip("/")
     # New format: characters/01.md
-    if path.startswith("characters/") and path.endswith(".md") and not path.startswith("characters/00-"):
+    if normalized.startswith("characters/") and normalized.endswith(".md") and not normalized.startswith("characters/00-"):
         return "character_card"
-    if path == "outline.md":
+    if re.fullmatch(r"outline_variants/[45]/outline\.md", normalized):
         return "outline_stage"
-    if path == "ledger/episode_outline.json":
+    if re.fullmatch(r"outline_variants/[45]/episode_outline\.json", normalized):
         return "episode_outline"
-    if path.startswith("episodes/ep") and path.endswith(".md"):
+    if normalized.startswith("episodes/ep") and normalized.endswith(".md"):
         return "episode_body"
     return "generic"
 
@@ -400,9 +396,7 @@ def start_methodology_trace(
         "ledger_docs_read": [],
         "warnings": [],
         "tool_failure_counts": {},
-        "episode_draft_attempts": [],
         "episode_write_attempts": [],
-        "revision_required_paths": [],
     }
 
 
@@ -970,12 +964,6 @@ _PROJECT_DOC_PATH_ALIASES = {
     "梗概.md": "synopsis.md",
     "故事梗概.md": "synopsis.md",
     "剧情梗概.md": "synopsis.md",
-    "大纲.md": "outline.md",
-    "短剧大纲.md": "outline.md",
-    "全集大纲.md": "outline.md",
-    "短剧全集大纲.md": "outline.md",
-    "分集大纲.md": "outline.md",
-    "剧集大纲.md": "outline.md",
 }
 
 
@@ -1243,15 +1231,13 @@ def write_project_doc(args: dict, **kw) -> str:
             project_id,
             "人物小传页只生成正式人物卡，不生成关系图。请继续逐个写入人物卡。",
         )
-    # ── episodes 写集门禁 ──
-    # collect 模式把超出 400-700 的第一稿捕获为草稿并返回成功，让 Hermes 结束
-    # 当前内层会话；唯一一次字数修订由 orchestrator 在外层发起。失败草稿绝不
-    # 进入 pending_workspace_writes，同一 trace 的第二次同路径提交直接忽略。
+    # 剧集首次非空提交就是交付底稿。字数只记录质量提示，不拒写、不重写。
     _episode_effective_chars: int | None = None
     _episode_attempt_payload: dict | None = None
     if isinstance(content, str) and path.startswith("episodes/ep"):
-        # 兼容：agent 若仍在 content 开头带 episode_contract 块，剥掉再算字数
         content, _discarded_contract = _strip_episode_contract_block(content)
+        if not content.strip():
+            return _tool_failure("write_project_doc", project_id, "剧集正文为空，无法写入。")
         normalized_path_for_gate = _normalize_project_doc_trace_path(path)
         _body_for_count = re.sub(r"```.*?```", "", content, flags=re.DOTALL)
         _body_for_count = re.sub(r"^\s*#+\s*", "", _body_for_count, flags=re.MULTILINE)
@@ -1262,8 +1248,6 @@ def write_project_doc(args: dict, **kw) -> str:
         _body_chars = len(_body_for_count)
         _episode_effective_chars = _body_chars
         _episode_write_mode = str(policy.get("write_mode") or "direct").strip()
-        _episode_phase = str(policy.get("episode_write_phase") or "initial").strip() or "initial"
-        _episode_attempt = 2 if _episode_phase == "revision" else 1
         trace = _active_methodology_trace()
 
         if _episode_write_mode == "collect" and trace is not None:
@@ -1272,83 +1256,37 @@ def write_project_doc(args: dict, **kw) -> str:
                 return _tool_failure("write_project_doc", project_id, capture_policy_error)
             seen_paths = trace.setdefault("_episode_write_paths_seen", [])
             if normalized_path_for_gate in seen_paths:
-                has_draft = any(
-                    isinstance(item, dict)
-                    and str(item.get("path") or "") == normalized_path_for_gate
-                    for item in trace.get("episode_draft_attempts") or []
-                )
                 return tool_result(
                     success=True,
                     path=normalized_path_for_gate,
                     normalized_path=normalized_path_for_gate,
                     duplicate_ignored=True,
-                    revision_required=has_draft,
                     accepted=normalized_path_for_gate in (trace.get("project_docs_written") or []),
                     effective_chars=_body_chars,
                     stop_current_turn=True,
-                    message="本路径本轮已提交过，当前内层回合结束，禁止再次生成。",
+                    message="本路径本轮已交付，禁止再次生成。",
                 )
             seen_paths.append(normalized_path_for_gate)
 
         _episode_attempt_payload = {
             "path": normalized_path_for_gate,
-            "phase": _episode_phase,
-            "attempt": _episode_attempt,
+            "phase": "initial",
+            "attempt": 1,
             "effective_chars": _body_chars,
-            "accepted": EPISODE_MIN_WRITE_CHARS <= _body_chars <= EPISODE_HARD_MAX_CHARS,
+            "accepted": True,
         }
-        if _body_chars < EPISODE_MIN_WRITE_CHARS or _body_chars > EPISODE_HARD_MAX_CHARS:
-            if _episode_write_mode == "collect" and trace is not None:
-                draft_payload = {
-                    **_episode_attempt_payload,
-                    "accepted": False,
-                    "revision_required": True,
-                    "content": content,
-                }
-                trace.setdefault("episode_draft_attempts", []).append(draft_payload)
-                trace.setdefault("episode_write_attempts", []).append(
-                    {key: value for key, value in draft_payload.items() if key != "content"}
-                )
-                _append_unique_trace_list("revision_required_paths", normalized_path_for_gate)
-                if _body_chars < EPISODE_MIN_WRITE_CHARS:
-                    _append_unique_trace_list(
-                        "warnings",
-                        f"length_under_min: {normalized_path_for_gate} "
-                        f"({_body_chars} < {EPISODE_MIN_WRITE_CHARS})",
-                    )
-                else:
-                    _append_unique_trace_list(
-                        "warnings",
-                        f"length_over_hard_cap: {normalized_path_for_gate} "
-                        f"({_body_chars} > hard cap {EPISODE_HARD_MAX_CHARS})",
-                    )
-                return tool_result(
-                    success=True,
-                    path=normalized_path_for_gate,
-                    normalized_path=normalized_path_for_gate,
-                    draft_captured=True,
-                    revision_required=True,
-                    accepted=False,
-                    effective_chars=_body_chars,
-                    stop_current_turn=True,
-                    message="初稿已捕获，字数修订由外层状态机处理；当前内层回合立即结束。",
-                )
-            if _body_chars < EPISODE_MIN_WRITE_CHARS:
-                _append_unique_trace_list("warnings",
-                    f"length_under_min: {normalized_path_for_gate} "
-                    f"({_body_chars} < {EPISODE_MIN_WRITE_CHARS})")
-                return _tool_failure("write_project_doc", project_id,
-                    f"正文只有 {_body_chars} 字，低于最低 {EPISODE_MIN_WRITE_CHARS} 字。"
-                    f"请写到 {EPISODE_MIN_WRITE_CHARS}-{EPISODE_HARD_MAX_CHARS} 字的完整剧集——"
-                    f"展开核心冲突、对话和场景，不要只写提纲或占位。")
-            if _body_chars > EPISODE_HARD_MAX_CHARS:
-                _append_unique_trace_list("warnings",
-                    f"length_over_hard_cap: {normalized_path_for_gate} "
-                    f"({_body_chars} > hard cap {EPISODE_HARD_MAX_CHARS})")
-                return _tool_failure("write_project_doc", project_id,
-                    f"正文 {_body_chars} 字，超硬上限 {EPISODE_HARD_MAX_CHARS} 字。"
-                    f"请压缩到 {EPISODE_HARD_MAX_CHARS} 字以内重写——删掉冗余描写和重复对话，"
-                    f"保留核心冲突和结尾钩子。")
+        if _body_chars < MIN_EPISODE_CHARS:
+            _append_unique_trace_list(
+                "warnings",
+                f"episode_length_advisory_under: {normalized_path_for_gate} "
+                f"({_body_chars} < {MIN_EPISODE_CHARS})",
+            )
+        elif _body_chars > MAX_EPISODE_CHARS:
+            _append_unique_trace_list(
+                "warnings",
+                f"episode_length_advisory_over: {normalized_path_for_gate} "
+                f"({_body_chars} > {MAX_EPISODE_CHARS})",
+            )
         # 波别要求：剧集正文严禁破折号「——」（DeepSeek 强写、SKILL/prompt 都管不住），
         # 写盘兜底：把「——」替换成全角逗号（对白/动作的连接停顿用逗号，语义无损）。
         content = content.replace("——", "，")
@@ -1417,7 +1355,6 @@ def write_project_doc(args: dict, **kw) -> str:
                 None,
             )
             payload = _manifest.to_pending_write(_canonical_content)
-            payload.pop("word_count_failed", None)
             if _episode_attempt_payload is not None:
                 payload.update(
                     {
@@ -1430,7 +1367,6 @@ def write_project_doc(args: dict, **kw) -> str:
                 pending.append(payload)
             else:
                 existing.update(payload)
-                existing.pop("word_count_failed", None)
             if _episode_attempt_payload is not None:
                 trace.setdefault("episode_write_attempts", []).append(_episode_attempt_payload)
         _emit_artifact_ready(project_id, normalized_path, _canonical_content, manifest=_manifest)
