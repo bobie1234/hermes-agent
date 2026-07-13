@@ -5458,6 +5458,24 @@ class AIAgent:
             for path in targets:
                 state.pop(path, None)
 
+    @staticmethod
+    def _tool_requested_turn_stop_response(messages: list) -> str:
+        """Return a trusted write-tool stop response from trailing tool messages."""
+        for tool_message in reversed(messages):
+            if not isinstance(tool_message, dict):
+                continue
+            if tool_message.get("role") != "tool":
+                break
+            if tool_message.get("name") != "write_project_doc":
+                continue
+            try:
+                payload = json.loads(str(tool_message.get("content") or ""))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if isinstance(payload, dict) and payload.get("stop_current_turn") is True:
+                return str(payload.get("message") or "项目文档候选已提交。")
+        return ""
+
     def _file_mutation_verifier_enabled(self) -> bool:
         """Check whether the per-turn file-mutation verifier footer is on.
 
@@ -14961,6 +14979,17 @@ class AIAgent:
                             pass
 
                     self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                    # Project tools may explicitly finish an inner execution
+                    # turn after producing one authoritative candidate. This
+                    # prevents the model from repeatedly overwriting the same
+                    # episode after a successful collect/capture result.
+                    _tool_stop_response = self._tool_requested_turn_stop_response(messages)
+                    if _tool_stop_response:
+                        _turn_exit_reason = "tool_requested_turn_stop"
+                        final_response = _tool_stop_response
+                        messages.append({"role": "assistant", "content": final_response})
+                        break
 
                     if self._tool_guardrail_halt_decision is not None:
                         decision = self._tool_guardrail_halt_decision

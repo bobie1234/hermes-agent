@@ -400,6 +400,9 @@ def start_methodology_trace(
         "ledger_docs_read": [],
         "warnings": [],
         "tool_failure_counts": {},
+        "episode_draft_attempts": [],
+        "episode_write_attempts": [],
+        "revision_required_paths": [],
     }
 
 
@@ -421,8 +424,7 @@ def _append_unique_trace_list(key: str, value) -> None:
         bucket.append(value)
 
 
-# A-STOPLOSS-THRESHOLD-BLACKBOX-01：stop_loss 阈值常量（原硬编码 5）。
-# 字数超限时模型需多次压缩尝试，给到 5 次机会。抽常量便于可观测/可调。
+# 非字数类工具错误的最后保险。正文超限由单次草稿捕获状态机处理，不再进入这里。
 STOP_LOSS_FAILURE_LIMIT = 5
 
 
@@ -445,7 +447,7 @@ def _tool_failure(tool_name: str, project_id: str, message: str) -> str:
     counts = trace.setdefault("tool_failure_counts", {})
     count = int(counts.get(tool_name, 0) or 0) + 1
     counts[tool_name] = count
-    if count > STOP_LOSS_FAILURE_LIMIT:
+    if count >= STOP_LOSS_FAILURE_LIMIT:
         _append_unique_trace_list(
             "warnings",
 f"tool_failure_stop_loss: {tool_name} failed {count}/{STOP_LOSS_FAILURE_LIMIT} times (single-file stop, run preserved)",
@@ -458,7 +460,7 @@ f"tool_failure_stop_loss: {tool_name} failed {count}/{STOP_LOSS_FAILURE_LIMIT} t
         trace["completion_reached"] = False
         return tool_error(
             f"该文件已连续写入失败 {STOP_LOSS_FAILURE_LIMIT} 次，停止重试此文件。"
-            "其他文件不受影响，请精简内容或点「检查问题」后重试本文件。"
+            "其他文件不受影响，请修正本次错误后重试该文件。"
         )
     return tool_error(message)
 
@@ -1222,7 +1224,7 @@ def write_project_doc(args: dict, **kw) -> str:
     trace = _active_methodology_trace()
     hard_stop = trace.get("tool_hard_stop") if isinstance(trace, dict) else None
     if isinstance(hard_stop, dict) and hard_stop.get("tool") == "write_project_doc" and hard_stop.get("reason") == "stop_loss":
-        return tool_error("该文件已停止重试，拒绝继续写入项目内容。请精简内容或点「检查问题」后重试本文件。")
+        return tool_error("该文件已停止重试，拒绝继续写入项目内容。请修正本次错误后重试该文件。")
 
     # Redirect user-facing Chinese stage filenames to canonical internal
     # paths before WritePolicy checks, otherwise a correct stage write can be
@@ -1242,12 +1244,11 @@ def write_project_doc(args: dict, **kw) -> str:
             "人物小传页只生成正式人物卡，不生成关系图。请继续逐个写入人物卡。",
         )
     # ── episodes 写集门禁 ──
-    # 字数三档从 xiaoma.episode_quality_contract 单源 import：
-    #   MIN_EPISODE_CHARS=500, MAX_EPISODE_CHARS=600, EPISODE_HARD_MAX_CHARS=700,
-    #   EPISODE_MIN_WRITE_CHARS=400
-    # 低于 EPISODE_MIN_WRITE_CHARS 拒写，超过 EPISODE_HARD_MAX_CHARS 拒写。
-    # 拒写时仍将 rejected draft 存入 pending_workspace_writes（collect 模式），
-    # 供 orchestrator 定向修订使用。不写盘（仅保留在 trace 中）。
+    # collect 模式把超出 400-700 的第一稿捕获为草稿并返回成功，让 Hermes 结束
+    # 当前内层会话；唯一一次字数修订由 orchestrator 在外层发起。失败草稿绝不
+    # 进入 pending_workspace_writes，同一 trace 的第二次同路径提交直接忽略。
+    _episode_effective_chars: int | None = None
+    _episode_attempt_payload: dict | None = None
     if isinstance(content, str) and path.startswith("episodes/ep"):
         # 兼容：agent 若仍在 content 开头带 episode_contract 块，剥掉再算字数
         content, _discarded_contract = _strip_episode_contract_block(content)
@@ -1259,33 +1260,79 @@ def write_project_doc(args: dict, **kw) -> str:
             "", _body_for_count,
         )
         _body_chars = len(_body_for_count)
+        _episode_effective_chars = _body_chars
+        _episode_write_mode = str(policy.get("write_mode") or "direct").strip()
+        _episode_phase = str(policy.get("episode_write_phase") or "initial").strip() or "initial"
+        _episode_attempt = 2 if _episode_phase == "revision" else 1
+        trace = _active_methodology_trace()
+
+        if _episode_write_mode == "collect" and trace is not None:
+            capture_policy_error = _path_allowed_by_policy(project_id, path)
+            if capture_policy_error:
+                return _tool_failure("write_project_doc", project_id, capture_policy_error)
+            seen_paths = trace.setdefault("_episode_write_paths_seen", [])
+            if normalized_path_for_gate in seen_paths:
+                has_draft = any(
+                    isinstance(item, dict)
+                    and str(item.get("path") or "") == normalized_path_for_gate
+                    for item in trace.get("episode_draft_attempts") or []
+                )
+                return tool_result(
+                    success=True,
+                    path=normalized_path_for_gate,
+                    normalized_path=normalized_path_for_gate,
+                    duplicate_ignored=True,
+                    revision_required=has_draft,
+                    accepted=normalized_path_for_gate in (trace.get("project_docs_written") or []),
+                    effective_chars=_body_chars,
+                    stop_current_turn=True,
+                    message="本路径本轮已提交过，当前内层回合结束，禁止再次生成。",
+                )
+            seen_paths.append(normalized_path_for_gate)
+
+        _episode_attempt_payload = {
+            "path": normalized_path_for_gate,
+            "phase": _episode_phase,
+            "attempt": _episode_attempt,
+            "effective_chars": _body_chars,
+            "accepted": EPISODE_MIN_WRITE_CHARS <= _body_chars <= EPISODE_HARD_MAX_CHARS,
+        }
         if _body_chars < EPISODE_MIN_WRITE_CHARS or _body_chars > EPISODE_HARD_MAX_CHARS:
-            # Store rejected draft for targeted revision before failing.
-            _rejected_write_mode = str(policy.get("write_mode") or "direct").strip()
-            if _rejected_write_mode == "collect":
-                trace = _active_methodology_trace()
-                if trace is not None:
-                    run_id = str(trace.get("run_id") or "")
-                    _seq = _next_artifact_sequence()
-                    _rej_manifest = _build_artifact_manifest(
-                        run_id=run_id,
-                        sequence=_seq,
-                        project_id=project_id,
-                        page=active_page(),
-                        path=normalized_path_for_gate,
-                        kind="episode_body",
-                        content=content,
+            if _episode_write_mode == "collect" and trace is not None:
+                draft_payload = {
+                    **_episode_attempt_payload,
+                    "accepted": False,
+                    "revision_required": True,
+                    "content": content,
+                }
+                trace.setdefault("episode_draft_attempts", []).append(draft_payload)
+                trace.setdefault("episode_write_attempts", []).append(
+                    {key: value for key, value in draft_payload.items() if key != "content"}
+                )
+                _append_unique_trace_list("revision_required_paths", normalized_path_for_gate)
+                if _body_chars < EPISODE_MIN_WRITE_CHARS:
+                    _append_unique_trace_list(
+                        "warnings",
+                        f"length_under_min: {normalized_path_for_gate} "
+                        f"({_body_chars} < {EPISODE_MIN_WRITE_CHARS})",
                     )
-                    pending = trace.setdefault("pending_workspace_writes", [])
-                    existing = next(
-                        (item for item in pending if str(item.get("path") or "") == normalized_path_for_gate),
-                        None,
+                else:
+                    _append_unique_trace_list(
+                        "warnings",
+                        f"length_over_hard_cap: {normalized_path_for_gate} "
+                        f"({_body_chars} > hard cap {EPISODE_HARD_MAX_CHARS})",
                     )
-                    payload = _rej_manifest.to_pending_write(content, word_count_failed=True)
-                    if existing is None:
-                        pending.append(payload)
-                    else:
-                        existing.update(payload)
+                return tool_result(
+                    success=True,
+                    path=normalized_path_for_gate,
+                    normalized_path=normalized_path_for_gate,
+                    draft_captured=True,
+                    revision_required=True,
+                    accepted=False,
+                    effective_chars=_body_chars,
+                    stop_current_turn=True,
+                    message="初稿已捕获，字数修订由外层状态机处理；当前内层回合立即结束。",
+                )
             if _body_chars < EPISODE_MIN_WRITE_CHARS:
                 _append_unique_trace_list("warnings",
                     f"length_under_min: {normalized_path_for_gate} "
@@ -1370,10 +1417,22 @@ def write_project_doc(args: dict, **kw) -> str:
                 None,
             )
             payload = _manifest.to_pending_write(_canonical_content)
+            payload.pop("word_count_failed", None)
+            if _episode_attempt_payload is not None:
+                payload.update(
+                    {
+                        "episode_write_phase": _episode_attempt_payload["phase"],
+                        "episode_write_attempt": _episode_attempt_payload["attempt"],
+                        "effective_chars": _episode_attempt_payload["effective_chars"],
+                    }
+                )
             if existing is None:
                 pending.append(payload)
             else:
                 existing.update(payload)
+                existing.pop("word_count_failed", None)
+            if _episode_attempt_payload is not None:
+                trace.setdefault("episode_write_attempts", []).append(_episode_attempt_payload)
         _emit_artifact_ready(project_id, normalized_path, _canonical_content, manifest=_manifest)
     else:
         # B-EPISODE-BACKUP-01：写入剧集文件前先备份旧版本。
@@ -1453,6 +1512,9 @@ def write_project_doc(args: dict, **kw) -> str:
     )
     _emit_progress("write", normalized_path)
 
+    _stop_episode_collect_turn = (
+        write_mode == "collect" and normalized_path.startswith("episodes/ep")
+    )
     return tool_result(
         success=True,
         path=normalized_path,
@@ -1460,6 +1522,12 @@ def write_project_doc(args: dict, **kw) -> str:
         original_path=original_path if original_path != path else None,
         bytes=len(content),
         overwritten=True,
+        stop_current_turn=_stop_episode_collect_turn,
+        message=(
+            "剧集候选已收集，当前内层回合立即结束。"
+            if _stop_episode_collect_turn
+            else None
+        ),
     )
 
 
