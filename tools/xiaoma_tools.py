@@ -418,7 +418,8 @@ def _append_unique_trace_list(key: str, value) -> None:
         bucket.append(value)
 
 
-# 非字数类工具错误的最后保险。正文超限由单次草稿捕获状态机处理，不再进入这里。
+# 非剧集生成任务的重复工具错误保险。剧集正文每集只允许一次提交，
+# 第一次失败也必须结束当前内层回合，由外层继续调度下一集。
 STOP_LOSS_FAILURE_LIMIT = 5
 
 
@@ -441,6 +442,16 @@ def _tool_failure(tool_name: str, project_id: str, message: str) -> str:
     counts = trace.setdefault("tool_failure_counts", {})
     count = int(counts.get(tool_name, 0) or 0) + 1
     counts[tool_name] = count
+    policy = active_project_write_policy() or {}
+    if (
+        tool_name == "write_project_doc"
+        and str(policy.get("page") or "") == "episodes"
+        and str(policy.get("action_intent") or "") in {"preset_execute", "custom_execute"}
+    ):
+        _append_unique_trace_list("warnings", f"episode_write_rejected_once: {message}")
+        trace["failure_stage"] = "episode_write_rejected"
+        trace["completion_reached"] = False
+        return tool_error(message, stop_current_turn=True)
     if count >= STOP_LOSS_FAILURE_LIMIT:
         _append_unique_trace_list(
             "warnings",

@@ -5473,7 +5473,11 @@ class AIAgent:
             except (json.JSONDecodeError, TypeError, ValueError):
                 continue
             if isinstance(payload, dict) and payload.get("stop_current_turn") is True:
-                return str(payload.get("message") or "项目文档候选已提交。")
+                return str(
+                    payload.get("message")
+                    or payload.get("error")
+                    or "项目文档候选已提交。"
+                )
         return ""
 
     def _file_mutation_verifier_enabled(self) -> bool:
