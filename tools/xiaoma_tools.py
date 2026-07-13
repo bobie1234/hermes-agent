@@ -449,13 +449,19 @@ def _tool_failure(tool_name: str, project_id: str, message: str) -> str:
         and str(policy.get("action_intent") or "") in {"preset_execute", "custom_execute"}
     ):
         _append_unique_trace_list("warnings", f"episode_write_rejected_once: {message}")
+        # 剧集单集回合：第一次写工具失败就结束当前内层回合，禁止 5 次重试。
+        # 外层 orchestrator 继续调度后续集；已成功集不受影响。
+        trace["tool_hard_stop"] = {
+            "tool": tool_name,
+            "reason": "episode_write_rejected_once",
+        }
         trace["failure_stage"] = "episode_write_rejected"
         trace["completion_reached"] = False
         return tool_error(message, stop_current_turn=True)
     if count >= STOP_LOSS_FAILURE_LIMIT:
         _append_unique_trace_list(
             "warnings",
-f"tool_failure_stop_loss: {tool_name} failed {count}/{STOP_LOSS_FAILURE_LIMIT} times (single-file stop, run preserved)",
+            f"tool_failure_stop_loss: {tool_name} failed {count}/{STOP_LOSS_FAILURE_LIMIT} times (single-file stop, run preserved)",
         )
         trace["tool_hard_stop"] = {
             "tool": tool_name,
@@ -1222,8 +1228,15 @@ def write_project_doc(args: dict, **kw) -> str:
 
     trace = _active_methodology_trace()
     hard_stop = trace.get("tool_hard_stop") if isinstance(trace, dict) else None
-    if isinstance(hard_stop, dict) and hard_stop.get("tool") == "write_project_doc" and hard_stop.get("reason") == "stop_loss":
-        return tool_error("该文件已停止重试，拒绝继续写入项目内容。请修正本次错误后重试该文件。")
+    if (
+        isinstance(hard_stop, dict)
+        and hard_stop.get("tool") == "write_project_doc"
+        and hard_stop.get("reason") in {"stop_loss", "episode_write_rejected_once"}
+    ):
+        return tool_error(
+            "该文件已停止重试，拒绝继续写入项目内容。请修正本次错误后重试该文件。",
+            stop_current_turn=True,
+        )
 
     # Redirect user-facing Chinese stage filenames to canonical internal
     # paths before WritePolicy checks, otherwise a correct stage write can be
