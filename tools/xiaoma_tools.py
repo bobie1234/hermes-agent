@@ -139,21 +139,42 @@ _CANCEL_LOCK = threading.Lock()
 _PROGRESS_SINK = None
 # A-Streaming-01 打假修复：线程级当前 page（per-thread dict 隔离并发），供 _emit_artifact_event 注入 page 字段
 _ACTIVE_PAGES_BY_THREAD: dict[int, str] = {}
-# Per-thread artifact sequence counter for identity allocation.
+# Artifact identity is scoped to a run, not to the worker thread. A single
+# run can execute several episode batches on different threads, and resetting
+# a thread counter made every batch reuse artifact_id=...-1.
 _ARTIFACT_SEQUENCE_BY_THREAD: dict[int, int] = {}
+_ARTIFACT_SEQUENCE_BY_RUN: dict[str, int] = {}
+_ARTIFACT_SEQUENCE_LOCK = threading.Lock()
 
 
-def _next_artifact_sequence() -> int:
-    """Allocate the next per-thread artifact sequence number."""
+def _next_artifact_sequence(run_id: str = "") -> int:
+    """Allocate a unique sequence within one run, safely across threads."""
+    normalized_run_id = str(run_id or "").strip()
+    if normalized_run_id:
+        with _ARTIFACT_SEQUENCE_LOCK:
+            seq = _ARTIFACT_SEQUENCE_BY_RUN.get(normalized_run_id, 0) + 1
+            _ARTIFACT_SEQUENCE_BY_RUN[normalized_run_id] = seq
+            return seq
     tid = threading.get_ident()
-    seq = _ARTIFACT_SEQUENCE_BY_THREAD.get(tid, 0) + 1
-    _ARTIFACT_SEQUENCE_BY_THREAD[tid] = seq
-    return seq
+    with _ARTIFACT_SEQUENCE_LOCK:
+        seq = _ARTIFACT_SEQUENCE_BY_THREAD.get(tid, 0) + 1
+        _ARTIFACT_SEQUENCE_BY_THREAD[tid] = seq
+        return seq
 
 
 def _reset_artifact_sequence() -> None:
-    """Reset the artifact sequence counter for the current thread."""
-    _ARTIFACT_SEQUENCE_BY_THREAD.pop(threading.get_ident(), None)
+    """Reset the legacy no-run fallback counter for the current thread."""
+    with _ARTIFACT_SEQUENCE_LOCK:
+        _ARTIFACT_SEQUENCE_BY_THREAD.pop(threading.get_ident(), None)
+
+
+def clear_artifact_sequence_for_run(run_id: str) -> None:
+    """Release the run-scoped identity counter after the run is complete."""
+    normalized_run_id = str(run_id or "").strip()
+    if not normalized_run_id:
+        return
+    with _ARTIFACT_SEQUENCE_LOCK:
+        _ARTIFACT_SEQUENCE_BY_RUN.pop(normalized_run_id, None)
 
 
 def _build_artifact_manifest(
@@ -292,7 +313,7 @@ def _emit_artifact_event(
         # Display event — minimal identity from trace for association
         trace = _active_methodology_trace() or {}
         run_id = str(trace.get("run_id") or "")
-        seq = _next_artifact_sequence()
+        seq = _next_artifact_sequence(run_id)
         event.update({
             "schema_version": 1,
             "run_id": run_id,
@@ -380,7 +401,6 @@ def start_methodology_trace(
     expected_skills: list[str] | None = None,
 ) -> None:
     """Start a per-thread methodology trace for one Hermes run."""
-    _reset_artifact_sequence()
     set_active_page(page)
     _METHODOLOGY_TRACES_BY_THREAD[threading.get_ident()] = {
         "run_id": run_id,
@@ -1359,7 +1379,7 @@ def write_project_doc(args: dict, **kw) -> str:
             .replace("+00:00", "Z"),
         )
 
-        _seq = _next_artifact_sequence()
+        _seq = _next_artifact_sequence(run_id)
         try:
             _manifest = _build_artifact_manifest(
                 run_id=run_id,
@@ -1451,7 +1471,7 @@ def write_project_doc(args: dict, **kw) -> str:
 
         # Direct write mode — construct manifest ONCE for the commit event
         if run_id:
-            _dseq = _next_artifact_sequence()
+            _dseq = _next_artifact_sequence(run_id)
             try:
                 _direct_manifest = _build_artifact_manifest(
                     run_id=run_id,
