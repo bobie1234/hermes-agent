@@ -26,6 +26,15 @@ from packages.artifact_canonicalization import (
     canonicalize_artifact_content,
 )
 from packages.artifact_contract import ArtifactManifest
+from packages.episode_outline_contract import (
+    is_episode_outline_path,
+    validate_episode_outline_content,
+)
+from packages.episode_revision_contract import (
+    existing_episode_paths_from_snapshot_cache,
+    normalize_episode_revision_target,
+    validate_pending_episode_revision_paths,
+)
 
 
 def _ensure_runtime_root_on_syspath() -> None:
@@ -1375,20 +1384,60 @@ def write_project_doc(args: dict, **kw) -> str:
                 "collect 模式缺少 run_id，无法发出正式 artifact 事件。",
             )
 
+        if is_episode_outline_path(normalized_path):
+            try:
+                validate_episode_outline_content(content)
+            except ValueError as exc:
+                return _tool_failure("write_project_doc", project_id, str(exc))
+
+        if (
+            normalized_path == "ledger/pending_episode_revisions.json"
+            and str(policy.get("action_intent") or "").strip() == "fix_problems"
+        ):
+            existing_paths = list(
+                existing_episode_paths_from_snapshot_cache(
+                    policy.get("workspace_snapshot_cache")
+                )
+            )
+            project_root = _PROJECTS_ROOT / project_id / "episodes"
+            if project_root.exists():
+                for child in project_root.iterdir():
+                    if not child.is_file():
+                        continue
+                    episode_path = normalize_episode_revision_target(
+                        f"episodes/{child.name}"
+                    )
+                    if episode_path and episode_path not in existing_paths:
+                        existing_paths.append(episode_path)
+            existing_paths = sorted(set(existing_paths))
+            path_error = validate_pending_episode_revision_paths(
+                content,
+                existing_episode_paths=existing_paths,
+            )
+            if path_error:
+                return _tool_failure("write_project_doc", project_id, path_error)
+
         # Canonicalize content before creating manifest so that
         # content_hash/bytes reflect the canonical (written) content.
         # on-the-fly normalization would produce a different content
         # hash at commit time.  The sidecar's artifact executor no
         # longer rehashes — it trusts the manifest computed here.
-        _canonical_content = canonicalize_artifact_content(
-            project_id=project_id,
-            path=normalized_path,
-            content=content,
-            workspace_context=_hermes_canonicalization_context(project_id),
-            now_iso=datetime.now(timezone.utc)
-            .isoformat(timespec="seconds")
-            .replace("+00:00", "Z"),
-        )
+        try:
+            _canonical_content = canonicalize_artifact_content(
+                project_id=project_id,
+                path=normalized_path,
+                content=content,
+                workspace_context=_hermes_canonicalization_context(project_id),
+                now_iso=datetime.now(timezone.utc)
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z"),
+            )
+        except ValueError as exc:
+            return _tool_failure(
+                "write_project_doc",
+                project_id,
+                str(exc) or "待确认修改规范化失败，请改用已落盘剧集后重试。",
+            )
         if (
             normalized_path == "ledger/pending_episode_revisions.json"
             and str(policy.get("action_intent") or "").strip() == "fix_problems"
