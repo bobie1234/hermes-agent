@@ -206,16 +206,27 @@ def _hermes_canonicalization_context(project_id: str) -> CanonicalizationContext
 
     Hermes can read local project files during collect, so the normalizer
     can fill in ``base_content_hash`` / ``old_content`` from the actual
-    episode files on disk.
+    episode files on disk. Desktop backend runs do not share the sidecar's
+    workspace directory, so the snapshot cache is the authoritative fallback
+    for the target episode in collect mode.
     """
 
+    snapshot_cache = _active_workspace_snapshot_cache()
+    snapshot_files = snapshot_cache.get("files") if isinstance(snapshot_cache.get("files"), dict) else {}
+
     def _read_file(path: str) -> str:
+        normalized = str(path or "").replace("\\", "/").strip().strip("/")
+        if normalized in snapshot_files:
+            return str(snapshot_files[normalized] or "")
         resolved = _resolve_project_path(project_id, path)
         if resolved is None or not resolved.exists():
             raise FileNotFoundError(f"episode file not found: {path}")
         return resolved.read_text(encoding="utf-8")
 
     def _resolve_file(path: str) -> Optional[str]:
+        normalized = str(path or "").replace("\\", "/").strip().strip("/")
+        if normalized in snapshot_files:
+            return normalized
         resolved = _resolve_project_path(project_id, path)
         return str(resolved) if resolved is not None else None
 
@@ -1378,6 +1389,16 @@ def write_project_doc(args: dict, **kw) -> str:
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z"),
         )
+        if (
+            normalized_path == "ledger/pending_episode_revisions.json"
+            and str(policy.get("action_intent") or "").strip() == "fix_problems"
+            and not (json.loads(_canonical_content).get("revisions") or [])
+        ):
+            return _tool_failure(
+                "write_project_doc",
+                project_id,
+                "本次修订至少要生成一条待确认修改记录，不能写入空修改清单。",
+            )
 
         _seq = _next_artifact_sequence(run_id)
         try:
