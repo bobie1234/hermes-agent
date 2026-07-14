@@ -364,10 +364,48 @@ def _infer_artifact_kind(path: str) -> str:
         return "episode_body"
     return "generic"
 
+def _current_progress_task_context() -> tuple[str, str]:
+    """Return (page, action_intent) for the active run, if known.
+
+    Write policy is the authoritative task context (set before agent runs).
+    Fall back to thread-local active page when policy is absent.
+    """
+    policy = active_project_write_policy() or {}
+    page = str(policy.get("page") or active_page() or "").strip()
+    action_intent = str(policy.get("action_intent") or "").strip()
+    return page, action_intent
+
+
 def _translate_tool_to_progress(action: str, path: str) -> str:
-    """工具调用 → 用户语言翻译表。核心：绝不暴露内部词。"""
+    """工具调用 → 用户语言翻译表。核心：绝不暴露内部词。
+
+    Path alone is not enough: outline generation reads characters/ as a
+    dependency. Without task context that looks like a character-page job.
+    Prefer the active page/action_intent so dependency reads stay framed as
+    preparation for the real task.
+    """
     p = str(path or "").replace("\\", "/").strip()
+    _page, action_intent = _current_progress_task_context()
+    outline_stage = action_intent in {"outline_stage_plan_4", "outline_stage_plan_5"}
+    episode_outline = action_intent in {"episode_outline_plan_4", "episode_outline_plan_5"}
+    is_characters_path = p.startswith("characters/") or p.rstrip("/") == "characters"
+
     if action == "read":
+        # Outline-generation dependency reads: never surface as a character main task.
+        if outline_stage:
+            if is_characters_path:
+                return "正在读取人物参考"
+            if "project_brief" in p or "synopsis" in p or p.startswith("ledger/"):
+                return "正在准备粗纲"
+            if "outline" in p:
+                return "正在整理大纲结构"
+            return "正在准备粗纲"
+        if episode_outline:
+            if is_characters_path:
+                return "正在读取人物参考"
+            if "outline" in p or "project_brief" in p or "synopsis" in p:
+                return "正在准备集纲"
+            return "正在准备集纲"
         if "project_brief" in p: return "正在回顾灵感设定"
         if "synopsis" in p: return "正在回顾故事梗概"
         if "outline" in p: return "正在回顾故事大纲"
@@ -378,6 +416,10 @@ def _translate_tool_to_progress(action: str, path: str) -> str:
         if p.rstrip("/") == "characters": return "正在整理人物列表"
         return "正在读取项目内容"
     elif action == "write":
+        if outline_stage and ("outline" in p or p.endswith(".md")):
+            return "正在生成故事大纲"
+        if episode_outline and ("episode_outline" in p or "outline" in p):
+            return "正在生成集纲"
         if p.startswith("episodes/ep"):
             # ep022 → 本轮第N集（从 ep 号算本轮序号，需要 external context）
             # 简化：直接用集号 - base + 1，但 base 未知，这里只返回"正在写入剧集"
@@ -388,8 +430,16 @@ def _translate_tool_to_progress(action: str, path: str) -> str:
         if p.startswith("characters/"): return "正在生成人物设定"
         return "正在写入内容"
     elif action == "list":
+        if outline_stage:
+            return "正在准备粗纲"
+        if episode_outline:
+            return "正在准备集纲"
         return "正在整理项目内容"
     elif action == "skill":
+        if outline_stage:
+            return "正在构思粗纲"
+        if episode_outline:
+            return "正在构思集纲"
         return "正在构思剧情"
     return ""
 
