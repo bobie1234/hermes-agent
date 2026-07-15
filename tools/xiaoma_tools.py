@@ -140,6 +140,12 @@ from xiaoma.episode_quality_contract import (
 )
 _WRITE_POLICIES_BY_THREAD: dict[int, dict] = {}
 _METHODOLOGY_TRACES_BY_THREAD: dict[int, dict] = {}
+# Parallel tool workers run on different thread ids; keep the parent turn's
+# policy/trace/page available as a process-local fallback so concurrent
+# write_project_doc calls still collect into pending_workspace_writes.
+_ACTIVE_WRITE_POLICY: Optional[dict] = None
+_ACTIVE_METHODOLOGY_TRACE: Optional[dict] = None
+_ACTIVE_PAGE: str = ""
 _CANCELLED_PROJECTS: set[str] = set()
 _CANCEL_LOCK = threading.Lock()
 
@@ -255,13 +261,17 @@ def clear_progress_sink():
     _PROGRESS_SINK = None
 
 def set_active_page(page: str):
+    global _ACTIVE_PAGE
     _ACTIVE_PAGES_BY_THREAD[threading.get_ident()] = page
+    _ACTIVE_PAGE = str(page or "")
 
 def clear_active_page():
+    global _ACTIVE_PAGE
     _ACTIVE_PAGES_BY_THREAD.pop(threading.get_ident(), None)
+    _ACTIVE_PAGE = ""
 
 def active_page() -> str:
-    return _ACTIVE_PAGES_BY_THREAD.get(threading.get_ident(), "")
+    return _ACTIVE_PAGES_BY_THREAD.get(threading.get_ident(), "") or _ACTIVE_PAGE
 
 def _emit_progress(action: str, path: str):
     """工具调用时触发进度信号。翻译表内置——绝不暴露 skill/tool/路径。"""
@@ -471,8 +481,9 @@ def start_methodology_trace(
     expected_skills: list[str] | None = None,
 ) -> None:
     """Start a per-thread methodology trace for one Hermes run."""
+    global _ACTIVE_METHODOLOGY_TRACE
     set_active_page(page)
-    _METHODOLOGY_TRACES_BY_THREAD[threading.get_ident()] = {
+    trace = {
         "run_id": run_id,
         "project_id": project_id,
         "page": page,
@@ -488,15 +499,25 @@ def start_methodology_trace(
         "tool_failure_counts": {},
         "episode_write_attempts": [],
     }
+    _METHODOLOGY_TRACES_BY_THREAD[threading.get_ident()] = trace
+    _ACTIVE_METHODOLOGY_TRACE = trace
 
 
 def consume_methodology_trace() -> dict:
     """Return and clear the current thread's methodology trace."""
-    return _METHODOLOGY_TRACES_BY_THREAD.pop(threading.get_ident(), {})
+    global _ACTIVE_METHODOLOGY_TRACE
+    thread_trace = _METHODOLOGY_TRACES_BY_THREAD.pop(threading.get_ident(), None)
+    if thread_trace is not None:
+        if _ACTIVE_METHODOLOGY_TRACE is thread_trace:
+            _ACTIVE_METHODOLOGY_TRACE = None
+        return thread_trace
+    fallback = _ACTIVE_METHODOLOGY_TRACE or {}
+    _ACTIVE_METHODOLOGY_TRACE = None
+    return fallback
 
 
 def _active_methodology_trace() -> Optional[dict]:
-    return _METHODOLOGY_TRACES_BY_THREAD.get(threading.get_ident())
+    return _METHODOLOGY_TRACES_BY_THREAD.get(threading.get_ident()) or _ACTIVE_METHODOLOGY_TRACE
 
 
 def _append_unique_trace_list(key: str, value) -> None:
@@ -599,20 +620,29 @@ def _record_cards_retrieved(args: dict, cards: list[dict], conflicts: list[dict]
 
 
 def set_project_write_policy(policy: dict | None) -> None:
-    """Set write policy for the current agent execution thread."""
+    """Set write policy for the current agent execution thread.
+
+    Also keep a process-local fallback so ThreadPoolExecutor tool workers
+    inherit collect/direct write mode and allowed paths.
+    """
+    global _ACTIVE_WRITE_POLICY
     thread_id = threading.get_ident()
     if policy is None:
         _WRITE_POLICIES_BY_THREAD.pop(thread_id, None)
+        _ACTIVE_WRITE_POLICY = None
     else:
         _WRITE_POLICIES_BY_THREAD[thread_id] = policy
+        _ACTIVE_WRITE_POLICY = policy
 
 
 def clear_project_write_policy() -> None:
+    global _ACTIVE_WRITE_POLICY
     _WRITE_POLICIES_BY_THREAD.pop(threading.get_ident(), None)
+    _ACTIVE_WRITE_POLICY = None
 
 
 def active_project_write_policy() -> Optional[dict]:
-    return _WRITE_POLICIES_BY_THREAD.get(threading.get_ident())
+    return _WRITE_POLICIES_BY_THREAD.get(threading.get_ident()) or _ACTIVE_WRITE_POLICY
 
 
 def _active_workspace_snapshot_cache() -> dict:
@@ -685,15 +715,26 @@ def _path_allowed_by_policy(project_id: str, path: str) -> Optional[str]:
                 missing_reads.append(item)
         if missing_reads:
             return f"写入前必须先读取：{', '.join(missing_reads)}"
-    specific_writes = [
-        _normalize_project_doc_trace_path(str(item))
-        for item in (policy.get("allowed_specific_writes") or [])
-        if str(item).strip()
-    ]
+    specific_writes = []
+    for item in (policy.get("allowed_specific_writes") or []):
+        raw = str(item or "").strip().replace("\\", "/")
+        if not raw:
+            continue
+        is_dir = raw.endswith("/")
+        normalized_item = _normalize_project_doc_trace_path(raw)
+        if is_dir and normalized_item and not normalized_item.endswith("/"):
+            normalized_item = f"{normalized_item}/"
+        if normalized_item:
+            specific_writes.append(normalized_item)
     normalized_path = _normalize_project_doc_trace_path(path)
+    def _specific_write_allows(item: str, candidate: str) -> bool:
+        # 目录前缀（submission/）必须放行其下文件；否则会把投稿四件套整包拦死。
+        if item.endswith("/"):
+            return candidate.startswith(item) or candidate.rstrip("/") == item.rstrip("/")
+        return candidate == item or fnmatch.fnmatch(candidate, item)
+
     if specific_writes and not any(
-        normalized_path == item or fnmatch.fnmatch(normalized_path, item)
-        for item in specific_writes
+        _specific_write_allows(item, normalized_path) for item in specific_writes
     ):
         # 超出本轮 specific-write 范围 —— 这是"集号/批次超范围"，
         # 不是"越页面"。必须给 agent 一条带具体允许文件的专属文案，
@@ -1249,7 +1290,8 @@ def list_project_docs(args: dict, **kw) -> str:
         return tool_error(
             f"Invalid directory: {path!r}. Use '' / '.' for the project root, "
             "or a known subdirectory (characters/, episodes/, ledger/, "
-            "manhua_prompts/, runs/, traces/)."
+            "manhua_prompts/, runs/, traces/, submission/, novel/, "
+            "outline_variants/, discussion_handoff/)."
         )
 
     if not target.exists():
