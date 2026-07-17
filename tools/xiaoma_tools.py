@@ -1442,7 +1442,7 @@ def write_project_doc(args: dict, **kw) -> str:
 
         if (
             normalized_path == "ledger/pending_episode_revisions.json"
-            and str(policy.get("action_intent") or "").strip() == "fix_problems"
+            and str(policy.get("action_intent") or "").strip() == "episode_rewrite"
         ):
             existing_paths = list(
                 existing_episode_paths_from_snapshot_cache(
@@ -1490,7 +1490,7 @@ def write_project_doc(args: dict, **kw) -> str:
             )
         if (
             normalized_path == "ledger/pending_episode_revisions.json"
-            and str(policy.get("action_intent") or "").strip() == "fix_problems"
+            and str(policy.get("action_intent") or "").strip() == "episode_rewrite"
             and not (json.loads(_canonical_content).get("revisions") or [])
         ):
             return _tool_failure(
