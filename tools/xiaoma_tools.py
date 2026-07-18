@@ -1390,13 +1390,39 @@ def write_project_doc(args: dict, **kw) -> str:
                 )
             seen_paths.append(normalized_path_for_gate)
 
+        from packages.quality.candidate_gate import evaluate_episode_candidate, may_promote
+
+        _quality = evaluate_episode_candidate(
+            content,
+            path=normalized_path_for_gate,
+            quality_pack_loaded=bool(trace.get("quality_pack_loaded") or trace.get("skills_loaded")),
+            skills_loaded=list(trace.get("skills_loaded") or []),
+        )
+        _accepted = may_promote(_quality)
         _episode_attempt_payload = {
             "path": normalized_path_for_gate,
             "phase": "initial",
             "attempt": 1,
             "effective_chars": _body_chars,
-            "accepted": True,
+            "accepted": _accepted,
+            "quality": _quality.to_dict(),
         }
+        if not _accepted:
+            for issue in _quality.blocking_issues:
+                _append_unique_trace_list(
+                    "warnings",
+                    f"episode_quality_rejected:{issue.code}:{normalized_path_for_gate}:{issue.message}",
+                )
+            return tool_result(
+                success=False,
+                path=normalized_path_for_gate,
+                normalized_path=normalized_path_for_gate,
+                accepted=False,
+                effective_chars=_body_chars,
+                quality=_quality.to_dict(),
+                message="候选正文未通过质量硬门禁，已保留供返修，不得晋升正式正文。",
+                stop_current_turn=True,
+            )
         if _body_chars < MIN_EPISODE_CHARS:
             _append_unique_trace_list(
                 "warnings",
