@@ -536,7 +536,7 @@ def _tool_failure(tool_name: str, project_id: str, message: str) -> str:
     if (
         tool_name == "write_project_doc"
         and str(policy.get("page") or "") == "episodes"
-        and str(policy.get("action_intent") or "") in {"preset_execute", "custom_execute"}
+        and str(policy.get("action_intent") or "") in {"preset_execute", "custom_execute", "workflow2_execute"}
     ):
         _append_unique_trace_list("warnings", f"episode_write_rejected_once: {message}")
         # 剧集单集回合：第一次写工具失败就结束当前内层回合，禁止 5 次重试。
