@@ -140,8 +140,6 @@ from xiaoma.episode_quality_contract import (
 )
 _WRITE_POLICIES_BY_THREAD: dict[int, dict] = {}
 _METHODOLOGY_TRACES_BY_THREAD: dict[int, dict] = {}
-_CANCELLED_PROJECTS: set[str] = set()
-_CANCEL_LOCK = threading.Lock()
 
 # A-EXECUTE-REALTIME-PROGRESS-SSE-01：进度 hook（agent 工具调用时触发）
 # orchestrator 注册一个回调，工具调用时推进度给前端（通过 SSE）
@@ -444,24 +442,34 @@ def _translate_tool_to_progress(action: str, path: str) -> str:
     return ""
 
 
-def mark_project_cancelled(project_id: str) -> None:
-    """Best-effort cancellation gate for long-running project writes."""
+def mark_project_cancelled(project_id: str, run_id: str = "") -> None:
+    """Best-effort cancellation gate for long-running project writes.
+
+    R03: delegates to packages.cancellation run-scoped registry.
+    """
     if not project_id:
         return
-    with _CANCEL_LOCK:
-        _CANCELLED_PROJECTS.add(str(project_id))
+    from packages.cancellation import request_cancel
+
+    request_cancel(project_id=str(project_id), run_id=str(run_id or ""), reason="cancelled")
 
 
-def clear_project_cancelled(project_id: str) -> None:
-    if not project_id:
+def clear_project_cancelled(project_id: str, run_id: str = "") -> None:
+    """Clear finished-run cancel state only.
+
+    Must not be used as a turn-start second source of truth.
+    """
+    if not project_id and not run_id:
         return
-    with _CANCEL_LOCK:
-        _CANCELLED_PROJECTS.discard(str(project_id))
+    from packages.cancellation import clear_context
+
+    clear_context(project_id=str(project_id or ""), run_id=str(run_id or ""))
 
 
-def _is_project_cancelled(project_id: str) -> bool:
-    with _CANCEL_LOCK:
-        return str(project_id) in _CANCELLED_PROJECTS
+def _is_project_cancelled(project_id: str, run_id: str = "") -> bool:
+    from packages.cancellation import is_cancelled
+
+    return is_cancelled(project_id=str(project_id or ""), run_id=str(run_id or ""))
 
 
 def start_methodology_trace(
