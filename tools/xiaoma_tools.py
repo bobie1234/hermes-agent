@@ -1398,7 +1398,11 @@ def write_project_doc(args: dict, **kw) -> str:
             quality_pack_loaded=bool(trace.get("quality_pack_loaded") or trace.get("skills_loaded")),
             skills_loaded=list(trace.get("skills_loaded") or []),
         )
-        _accepted = may_promote(_quality)
+        # SSS owns round semantics: every fixed round must deliver a new draft;
+        # until_all_pass decides whether to run another round from the quality
+        # result after delivery. Do not turn a round into a no-write failure.
+        _workflow2_round = str(policy.get("action_intent") or "") == "workflow2_execute"
+        _accepted = may_promote(_quality) or _workflow2_round
         _episode_attempt_payload = {
             "path": normalized_path_for_gate,
             "phase": "initial",
@@ -1423,6 +1427,12 @@ def write_project_doc(args: dict, **kw) -> str:
                 message="候选正文未通过质量硬门禁，已保留供返修，不得晋升正式正文。",
                 stop_current_turn=True,
             )
+        if _workflow2_round:
+            for issue in _quality.blocking_issues:
+                _append_unique_trace_list(
+                    "warnings",
+                    f"episode_quality_advisory:{issue.code}:{normalized_path_for_gate}:{issue.message}",
+                )
         if _body_chars < MIN_EPISODE_CHARS:
             _append_unique_trace_list(
                 "warnings",
