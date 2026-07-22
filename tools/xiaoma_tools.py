@@ -1342,17 +1342,6 @@ def write_project_doc(args: dict, **kw) -> str:
     original_path = path
     path = _normalize_episode_doc_path(_canonical_project_doc_path(path))
     policy = active_project_write_policy() or {}
-    if (
-        str(policy.get("page") or "") == "character-biography"
-        and str(policy.get("action_intent") or "") == "preset_execute"
-        and _normalize_project_doc_trace_path(path) == "characters/00-人物关系图.md"
-    ):
-        _append_unique_trace_list("warnings", "character_relationship_map_write_blocked")
-        return _tool_failure(
-            "write_project_doc",
-            project_id,
-            "人物小传页只生成正式人物卡，不生成关系图。请继续逐个写入人物卡。",
-        )
     # 剧集首次非空提交就是交付底稿。字数只记录质量提示，不拒写、不重写。
     _episode_effective_chars: int | None = None
     _episode_attempt_payload: dict | None = None
@@ -1392,17 +1381,21 @@ def write_project_doc(args: dict, **kw) -> str:
 
         from packages.quality.candidate_gate import evaluate_episode_candidate, may_promote
 
+        _trace_skills = list((trace or {}).get("skills_loaded") or [])
         _quality = evaluate_episode_candidate(
             content,
             path=normalized_path_for_gate,
-            quality_pack_loaded=bool(trace.get("quality_pack_loaded") or trace.get("skills_loaded")),
-            skills_loaded=list(trace.get("skills_loaded") or []),
+            quality_pack_loaded=bool((trace or {}).get("quality_pack_loaded") or _trace_skills),
+            skills_loaded=_trace_skills,
         )
-        # SSS owns round semantics: every fixed round must deliver a new draft;
-        # until_all_pass decides whether to run another round from the quality
-        # result after delivery. Do not turn a round into a no-write failure.
-        _workflow2_round = str(policy.get("action_intent") or "") == "workflow2_execute"
-        _accepted = may_promote(_quality) or _workflow2_round
+        # Fixed-round delivery intents own round semantics: every fixed round
+        # must deliver a draft. until_all_pass decides whether to continue after
+        # delivery. Do not turn a round into a no-write failure.
+        _soft_promote_intent = str(policy.get("action_intent") or "") in {
+            "workflow2_execute",
+            "fix_problems",
+        }
+        _accepted = may_promote(_quality) or _soft_promote_intent
         _episode_attempt_payload = {
             "path": normalized_path_for_gate,
             "phase": "initial",
@@ -1427,7 +1420,7 @@ def write_project_doc(args: dict, **kw) -> str:
                 message="候选正文未通过质量硬门禁，已保留供返修，不得晋升正式正文。",
                 stop_current_turn=True,
             )
-        if _workflow2_round:
+        if _soft_promote_intent:
             for issue in _quality.blocking_issues:
                 _append_unique_trace_list(
                     "warnings",
