@@ -103,6 +103,7 @@ except ImportError:
 try:
     from packages.xiaoma_config import (
         PROJECTS_ROOT as _PROJECTS_ROOT,
+        WORKSPACE_ROOT as _WORKSPACE_ROOT,
         PROCESSED_ROOT as _KNOWLEDGE_ROOT,
         STABLE_ROOT as _STABLE_ROOT,
         REDFRUIT_ROOT as _REDFRUIT_ROOT,
@@ -122,10 +123,66 @@ except ImportError:
             _base,
         )
     _PROJECTS_ROOT = _base / "data" / "projects"
+    _WORKSPACE_ROOT = Path(os.environ.get("XIAOMA_WORKSPACE_ROOT", str(_base / "data" / "workspaces")))
     _KNOWLEDGE_ROOT = _base / "packages" / "knowledge" / "processed"
     _STABLE_ROOT = _base / "packages" / "knowledge" / "stable"
     _REDFRUIT_ROOT = _KNOWLEDGE_ROOT / "redfruit-2026-05"
     _TOPIC_PACKS_ROOT = _KNOWLEDGE_ROOT / "topic-packs"
+
+# Desktop truth: Tauri sets XIAOMA_PROJECTS_ROOT / XIAOMA_WORKSPACE_ROOT to the
+# AppData workspace root. Backend Hermes often only inherits XIAOMA_APP_ROOT and
+# would otherwise read empty data/projects/<id>. Prefer env overrides, then
+# WORKSPACE_ROOT when the project only exists there.
+_env_projects = os.environ.get("XIAOMA_PROJECTS_ROOT", "").strip()
+_env_workspace = os.environ.get("XIAOMA_WORKSPACE_ROOT", "").strip()
+_env_local_workspace = os.environ.get("LOCAL_WORKSPACE_PATH", "").strip()
+if _env_projects:
+    _PROJECTS_ROOT = Path(_env_projects)
+elif _env_workspace:
+    _PROJECTS_ROOT = Path(_env_workspace)
+elif _env_local_workspace:
+    _PROJECTS_ROOT = Path(_env_local_workspace)
+else:
+    try:
+        _ws = Path(_WORKSPACE_ROOT)
+    except Exception:
+        _ws = None
+    if _ws is not None:
+        # Keep default PROJECTS_ROOT; read path resolver can still fall back.
+        pass
+
+
+def _projects_root_for(project_id: str):
+    """Return the projects root that actually contains this project_id."""
+    pid = str(project_id or "").strip()
+    candidates = []
+    for root in (_PROJECTS_ROOT,):
+        try:
+            candidates.append(Path(root))
+        except Exception:
+            pass
+    for env_name in ("XIAOMA_PROJECTS_ROOT", "XIAOMA_WORKSPACE_ROOT", "LOCAL_WORKSPACE_PATH"):
+        raw = os.environ.get(env_name, "").strip()
+        if raw:
+            candidates.append(Path(raw))
+    try:
+        candidates.append(Path(_WORKSPACE_ROOT))
+    except Exception:
+        pass
+    seen = set()
+    for root in candidates:
+        try:
+            resolved = root.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not pid:
+            return resolved
+        if (resolved / pid).exists():
+            return resolved
+    return Path(_PROJECTS_ROOT)
 
 # ---------------------------------------------------------------------------
 # Security helpers (inline; avoids importing the full security module for
@@ -928,12 +985,13 @@ def _resolve_project_path(project_id: str, path: str) -> Optional[Path]:
     """
     try:
         from packages.workspace_resolver import resolve_project_path as _resolver
-        return _resolver(project_id, path, projects_root=_PROJECTS_ROOT)
+        root = _projects_root_for(project_id)
+        return _resolver(project_id, path, projects_root=root)
     except ImportError:
         pass
 
     # Fallback: basic traversal protection (when resolver module unavailable)
-    project_root = (_PROJECTS_ROOT / project_id).resolve()
+    project_root = (_projects_root_for(project_id) / project_id).resolve()
     target = (project_root / path).resolve()
     try:
         target.relative_to(project_root)
@@ -1253,7 +1311,7 @@ def _resolve_project_dir(project_id: str, path: str) -> Optional[Path]:
     """
     try:
         from packages.workspace_resolver import resolve_project_dir as _dir_resolver
-        return _dir_resolver(project_id, path, projects_root=_PROJECTS_ROOT)
+        return _dir_resolver(project_id, path, projects_root=_projects_root_for(project_id))
     except ImportError:
         pass
 
@@ -1281,7 +1339,7 @@ def _resolve_project_dir(project_id: str, path: str) -> Optional[Path]:
     }
     if normalized not in known_dirs:
         return None
-    project_root = (_PROJECTS_ROOT / project_id).resolve()
+    project_root = (_projects_root_for(project_id) / project_id).resolve()
     target = (project_root / normalized).resolve() if normalized else project_root
     try:
         target.relative_to(project_root)
