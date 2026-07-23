@@ -262,13 +262,28 @@ def active_page() -> str:
     return _ACTIVE_PAGES_BY_THREAD.get(threading.get_ident(), "")
 
 def _emit_progress(action: str, path: str):
-    """工具调用时触发进度信号。翻译表内置——绝不暴露 skill/tool/路径。"""
+    """Emit one structured, user-visible action event for the running task."""
     if _PROGRESS_SINK is None:
         return
     msg = _translate_tool_to_progress(action, path)
     if msg:
+        trace = _active_methodology_trace() or {}
+        events = trace.setdefault("action_events", [])
+        event = {
+            "type": "action",
+            "schema_version": 1,
+            "sequence": len(events) + 1,
+            "run_id": str(trace.get("run_id") or ""),
+            "action": str(action or ""),
+            "path": str(path or ""),
+            "page": active_page(),
+            "message": msg,
+            "progress": msg,
+            "phase": "completed",
+        }
+        events.append({key: value for key, value in event.items() if key not in {"type", "schema_version", "progress"}})
         try:
-            _PROGRESS_SINK({"progress": msg, "action": action, "path": path})
+            _PROGRESS_SINK(event)
         except Exception:
             pass  # 进度推送失败不影响主流程
 
