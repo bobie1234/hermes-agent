@@ -462,8 +462,46 @@ def _current_progress_task_context() -> tuple[str, str]:
     return page, action_intent
 
 
+def _describe_doc_path(path: str) -> str:
+    """路径 → 用户可理解的具体文档名（不暴露内部目录结构）。
+
+    B-UX-EXEC-TIMELINE-03：执行时间线文案要带具体内容（如“人物卡 01”“第 3 集”），
+    而不是一律笼统的“人物设定”“剧集”。返回空串表示无法从路径推断。
+    """
+    p = str(path or "").replace("\\", "/").strip().strip("/")
+    if not p:
+        return ""
+    m = re.search(r"episodes/ep0*(\d+)", p)
+    if m:
+        return f"第 {int(m.group(1))} 集"
+    m = re.search(r"characters/0*(\d+)\.md", p)
+    if m:
+        return f"人物卡 {int(m.group(1)):02d}"
+    m = re.search(r"outline_variants/([45])/outline\.md", p)
+    if m:
+        return f"故事大纲（{m.group(1)}级）"
+    if "episode_outline" in p:
+        return "集纲"
+    if "project_brief" in p:
+        return "灵感设定"
+    if "synopsis" in p:
+        return "故事梗概"
+    if "outline" in p:
+        return "故事大纲"
+    if p.rstrip("/") == "characters":
+        return "人物列表"
+    if p.rstrip("/") == "episodes":
+        return "剧集目录"
+    if p.startswith("ledger/"):
+        return "连续性记录"
+    return ""
+
+
 def _translate_tool_to_progress(action: str, path: str) -> str:
     """工具调用 → 用户语言翻译表。核心：绝不暴露内部词。
+
+    B-UX-EXEC-TIMELINE-03：在动词之外尽量带上具体文档名（如“回顾人物卡 01”
+    “写入第 3 集”），让执行时间线读起来是真实操作而非笼统泛称。
 
     Path alone is not enough: outline generation reads characters/ as a
     dependency. Without task context that looks like a character-page job.
@@ -475,52 +513,44 @@ def _translate_tool_to_progress(action: str, path: str) -> str:
     outline_stage = action_intent in {"outline_stage_plan_4", "outline_stage_plan_5"}
     episode_outline = action_intent in {"episode_outline_plan_4", "episode_outline_plan_5"}
     is_characters_path = p.startswith("characters/") or p.rstrip("/") == "characters"
+    doc = _describe_doc_path(p)
 
     if action == "read":
         # Outline-generation dependency reads: never surface as a character main task.
         if outline_stage:
             if is_characters_path:
-                return "正在读取人物参考"
+                return f"正在读取{doc}作参考" if doc else "正在读取人物参考"
             if "project_brief" in p or "synopsis" in p or p.startswith("ledger/"):
-                return "正在准备粗纲"
+                return f"正在回顾{doc}" if doc else "正在准备粗纲"
             if "outline" in p:
                 return "正在整理大纲结构"
             return "正在准备粗纲"
         if episode_outline:
             if is_characters_path:
-                return "正在读取人物参考"
+                return f"正在读取{doc}作参考" if doc else "正在读取人物参考"
             if "outline" in p or "project_brief" in p or "synopsis" in p:
-                return "正在准备集纲"
+                return f"正在回顾{doc}，准备集纲" if doc else "正在准备集纲"
             return "正在准备集纲"
-        if "project_brief" in p: return "正在回顾灵感设定"
-        if "synopsis" in p: return "正在回顾故事梗概"
-        if "outline" in p: return "正在回顾故事大纲"
-        if p.startswith("characters/"): return "正在回顾人物设定"
-        if p.startswith("episodes/"): return "正在回顾已有剧集"
-        if p.startswith("ledger/"): return "正在整理连续性记录"
-        if p.rstrip("/") == "episodes": return "正在整理已写剧集"
-        if p.rstrip("/") == "characters": return "正在整理人物列表"
+        # 通用读取：目录/账本类用“整理”，内容类用“回顾”，均带具体文档名。
+        if p.rstrip("/") in {"characters", "episodes"} or p.startswith("ledger/"):
+            return f"正在整理{doc}" if doc else "正在整理项目内容"
+        if doc:
+            return f"正在回顾{doc}"
         return "正在读取项目内容"
     elif action == "write":
         if outline_stage and ("outline" in p or p.endswith(".md")):
-            return "正在生成故事大纲"
+            return f"正在写入{doc}" if doc else "正在生成故事大纲"
         if episode_outline and ("episode_outline" in p or "outline" in p):
-            return "正在生成集纲"
-        if p.startswith("episodes/ep"):
-            # ep022 → 本轮第N集（从 ep 号算本轮序号，需要 external context）
-            # 简化：直接用集号 - base + 1，但 base 未知，这里只返回"正在写入剧集"
-            return "正在写入剧集"
-        if "project_brief" in p: return "正在生成灵感总结"
-        if "synopsis" in p: return "正在生成故事梗概"
-        if "outline" in p: return "正在生成故事大纲"
-        if p.startswith("characters/"): return "正在生成人物设定"
+            return f"正在写入{doc}" if doc else "正在生成集纲"
+        if doc:
+            return f"正在写入{doc}"
         return "正在写入内容"
     elif action == "list":
         if outline_stage:
             return "正在准备粗纲"
         if episode_outline:
             return "正在准备集纲"
-        return "正在整理项目内容"
+        return f"正在整理{doc}" if doc else "正在整理项目内容"
     elif action == "skill":
         if outline_stage:
             return "正在构思粗纲"
