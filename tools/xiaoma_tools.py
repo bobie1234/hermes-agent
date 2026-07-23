@@ -261,31 +261,50 @@ def clear_active_page():
 def active_page() -> str:
     return _ACTIVE_PAGES_BY_THREAD.get(threading.get_ident(), "")
 
-def _emit_progress(action: str, path: str):
-    """Emit one structured, user-visible action event for the running task."""
+def _emit_progress(action: str, path: str, *, phase: str = "completed", message: str | None = None):
+    """Emit one structured, user-visible action event for the running task.
+
+    Phases: ``started`` (before the tool body), ``completed`` (success),
+    ``failed`` (tool rejected or errored). Callers that only know the final
+    outcome may keep the default ``completed``.
+    """
     if _PROGRESS_SINK is None:
         return
-    msg = _translate_tool_to_progress(action, path)
-    if msg:
-        trace = _active_methodology_trace() or {}
-        events = trace.setdefault("action_events", [])
-        event = {
-            "type": "action",
-            "schema_version": 1,
-            "sequence": len(events) + 1,
-            "run_id": str(trace.get("run_id") or ""),
-            "action": str(action or ""),
-            "path": str(path or ""),
-            "page": active_page(),
-            "message": msg,
-            "progress": msg,
-            "phase": "completed",
-        }
-        events.append({key: value for key, value in event.items() if key not in {"type", "schema_version", "progress"}})
-        try:
-            _PROGRESS_SINK(event)
-        except Exception:
-            pass  # 进度推送失败不影响主流程
+    safe_phase = str(phase or "completed").strip() or "completed"
+    if safe_phase not in {"started", "completed", "failed"}:
+        safe_phase = "completed"
+    msg = str(message or "").strip() or _translate_tool_to_progress(action, path)
+    if not msg:
+        return
+    if safe_phase == "started" and not str(message or "").strip():
+        # Prefix so the timeline distinguishes in-flight from finished steps
+        # without requiring every call site to craft a custom message.
+        if not msg.startswith("正在"):
+            msg = f"正在{msg}"
+    elif safe_phase == "failed" and not str(message or "").strip():
+        if not msg.startswith("未能") and not msg.startswith("失败"):
+            msg = f"未能{msg}"
+    trace = _active_methodology_trace() or {}
+    events = trace.setdefault("action_events", [])
+    event = {
+        "type": "action",
+        "schema_version": 1,
+        "sequence": len(events) + 1,
+        "run_id": str(trace.get("run_id") or ""),
+        "action": str(action or ""),
+        "path": str(path or ""),
+        "page": active_page(),
+        "message": msg,
+        "progress": msg,
+        "phase": safe_phase,
+    }
+    events.append(
+        {key: value for key, value in event.items() if key not in {"type", "schema_version", "progress"}}
+    )
+    try:
+        _PROGRESS_SINK(event)
+    except Exception:
+        pass  # 进度推送失败不影响主流程
 
 
 def _emit_artifact_commit(
@@ -1139,16 +1158,44 @@ def read_project_doc(args: dict, **kw) -> str:
     if err:
         return _tool_failure("read_project_doc", project_id, err)
 
+    # Agents often pass a directory (e.g. characters/ or outline_variants/5/)
+    # to "read" when they mean list. Route those to list_project_docs instead
+    # of treating them as path-traversal failures.
+    stripped_for_dir = str(path or "").strip().replace("\\", "/").strip("/")
+    looks_like_dir = (
+        not stripped_for_dir
+        or stripped_for_dir.endswith("/")
+        or ("." not in Path(stripped_for_dir).name)
+    )
+    if looks_like_dir and _resolve_project_dir(project_id, path) is not None:
+        return list_project_docs(
+            {
+                "project_id": project_id,
+                "path": stripped_for_dir,
+                "include_content": False,
+            }
+        )
+
+    _emit_progress("read", path, phase="started")
     target = _resolve_project_path(project_id, path)
     if target is None:
-        return _tool_failure("read_project_doc", project_id, f"Path traversal blocked: {path!r}")
+        _emit_progress("read", path, phase="failed")
+        return _tool_failure(
+            "read_project_doc",
+            project_id,
+            (
+                f"Invalid file path: {path!r}. Use a concrete project file "
+                f"(e.g. outline_variants/5/outline.md or characters/01.md), "
+                f"or list_project_docs for a directory."
+            ),
+        )
 
     snapshot_cache = _active_workspace_snapshot_cache()
     snapshot_files = snapshot_cache.get("files") if isinstance(snapshot_cache.get("files"), dict) else {}
     if path in snapshot_files:
         content = str(snapshot_files.get(path) or "")
         _append_unique_trace_list("project_docs_read", path)
-        _emit_progress("read", path)
+        _emit_progress("read", path, phase="completed")
         return tool_result(
             success=True,
             content=content,
@@ -1158,26 +1205,39 @@ def read_project_doc(args: dict, **kw) -> str:
         )
 
     if not target.exists():
+        _emit_progress("read", path, phase="failed")
         return _tool_failure("read_project_doc", project_id, f"File not found: data/projects/{project_id}/{path}")
 
     if not target.is_file():
-        return _tool_failure("read_project_doc", project_id, f"Not a file: data/projects/{project_id}/{path}")
+        # Directory reached file resolver — hand off to list for better recovery.
+        _emit_progress("read", path, phase="failed")
+        listed = list_project_docs(
+            {
+                "project_id": project_id,
+                "path": stripped_for_dir,
+                "include_content": False,
+            }
+        )
+        return listed
 
     try:
         content = target.read_text(encoding="utf-8")
     except UnicodeDecodeError:
+        _emit_progress("read", path, phase="failed")
         return _tool_failure(
             "read_project_doc",
             project_id,
             f"Cannot read binary file: data/projects/{project_id}/{path}"
         )
     except Exception as exc:
+        _emit_progress("read", path, phase="failed")
         return _tool_failure("read_project_doc", project_id, f"Read error: {exc}")
 
     _append_unique_trace_list(
         "project_docs_read",
         target.relative_to(_PROJECTS_ROOT / project_id).as_posix(),
     )
+    _emit_progress("read", path, phase="completed")
 
     return tool_result(
         success=True,
@@ -1207,7 +1267,22 @@ def _resolve_project_dir(project_id: str, path: str) -> Optional[Path]:
     normalized = "" if stripped in {"", ".", "/", "./", "\\"} else stripped.replace("\\", "/").strip("/")
     if ".." in normalized.split("/"):
         return None
-    if normalized not in {"", "characters", "episodes", "ledger", "runs", "traces", "manhua_prompts"}:
+    known_dirs = {
+        "",
+        "characters",
+        "episodes",
+        "ledger",
+        "runs",
+        "traces",
+        "manhua_prompts",
+        "discussion_handoff",
+        "submission",
+        "novel",
+        "outline_variants",
+        "outline_variants/4",
+        "outline_variants/5",
+    }
+    if normalized not in known_dirs:
         return None
     project_root = (_PROJECTS_ROOT / project_id).resolve()
     target = (project_root / normalized).resolve() if normalized else project_root
@@ -1238,6 +1313,7 @@ def list_project_docs(args: dict, **kw) -> str:
     if err:
         return tool_error(err)
 
+    _emit_progress("list", path or ".", phase="started")
     snapshot_cache = _active_workspace_snapshot_cache()
     snapshot_dirs = snapshot_cache.get("dirs") if isinstance(snapshot_cache.get("dirs"), dict) else {}
     normalized_input = "" if (path or "").strip() in {"", ".", "/", "./", "\\"} else (path or "").strip().replace("\\", "/").strip("/")
@@ -1258,6 +1334,7 @@ def list_project_docs(args: dict, **kw) -> str:
 
         trace_path = _normalize_project_doc_trace_path(normalized_input, is_dir=bool(normalized_input))
         _append_unique_trace_list("project_docs_listed", trace_path or ".")
+        _emit_progress("list", path or ".", phase="completed")
         return tool_result(
             success=True,
             path=path,
@@ -1269,16 +1346,20 @@ def list_project_docs(args: dict, **kw) -> str:
 
     target = _resolve_project_dir(project_id, path)
     if target is None:
+        _emit_progress("list", path or ".", phase="failed")
         return tool_error(
             f"Invalid directory: {path!r}. Use '' / '.' for the project root, "
             "or a known subdirectory (characters/, episodes/, ledger/, "
+            "outline_variants/, outline_variants/4/, outline_variants/5/, "
             "manhua_prompts/, runs/, traces/)."
         )
 
     if not target.exists():
+        _emit_progress("list", path or ".", phase="completed")
         return tool_result(success=True, path=path, files=[], dirs=[], count=0)
 
     if not target.is_dir():
+        _emit_progress("list", path or ".", phase="failed")
         return tool_error(f"Not a directory: data/projects/{project_id}/{path}")
 
     project_root = (_PROJECTS_ROOT / project_id).resolve()
@@ -1314,6 +1395,7 @@ def list_project_docs(args: dict, **kw) -> str:
     trace_path = "" if (path or "").strip() in {"", ".", "/", "./", "\\"} else (path or "").strip().replace("\\", "/").strip("/")
     trace_path = _normalize_project_doc_trace_path(trace_path, is_dir=bool(trace_path))
     _append_unique_trace_list("project_docs_listed", trace_path or ".")
+    _emit_progress("list", path or ".", phase="completed")
 
     return tool_result(
         success=True,
@@ -1461,8 +1543,10 @@ def write_project_doc(args: dict, **kw) -> str:
         content = re.sub(r"(?<!\n)(?<=.)([ \t]*)(?=△)", "\n", content)
     # ──────────────────────────────────────────────────────────────────
 
+    _emit_progress("write", path, phase="started")
     policy_error = _path_allowed_by_policy(project_id, path)
     if policy_error:
+        _emit_progress("write", path, phase="failed")
         return _tool_failure("write_project_doc", project_id, policy_error)
 
     err = _check_project_id(project_id)
@@ -1471,6 +1555,7 @@ def write_project_doc(args: dict, **kw) -> str:
 
     target = _resolve_project_path(project_id, path)
     if target is None:
+        _emit_progress("write", path, phase="failed")
         return _tool_failure("write_project_doc", project_id, f"Path traversal blocked: {path!r}")
 
     normalized_path = target.relative_to(_PROJECTS_ROOT / project_id).as_posix()
@@ -1662,7 +1747,7 @@ def write_project_doc(args: dict, **kw) -> str:
         "project_docs_written",
         normalized_path,
     )
-    _emit_progress("write", normalized_path)
+    _emit_progress("write", normalized_path, phase="completed")
 
     _stop_episode_collect_turn = (
         write_mode == "collect" and normalized_path.startswith("episodes/ep")
