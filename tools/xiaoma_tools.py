@@ -267,6 +267,10 @@ def _emit_progress(action: str, path: str, *, phase: str = "completed", message:
     Phases: ``started`` (before the tool body), ``completed`` (success),
     ``failed`` (tool rejected or errored). Callers that only know the final
     outcome may keep the default ``completed``.
+
+    Message copy stays phase-neutral (usually already starts with 正在…);
+    the frontend history collapses completed steps and keeps a separate
+    "current activity" line for started/failed.
     """
     if _PROGRESS_SINK is None:
         return
@@ -276,14 +280,7 @@ def _emit_progress(action: str, path: str, *, phase: str = "completed", message:
     msg = str(message or "").strip() or _translate_tool_to_progress(action, path)
     if not msg:
         return
-    if safe_phase == "started" and not str(message or "").strip():
-        # Prefix so the timeline distinguishes in-flight from finished steps
-        # without requiring every call site to craft a custom message.
-        if not msg.startswith("正在"):
-            msg = f"正在{msg}"
-    elif safe_phase == "failed" and not str(message or "").strip():
-        if not msg.startswith("未能") and not msg.startswith("失败"):
-            msg = f"未能{msg}"
+    # Do not double-prefix 正在/未能: translate already returns user-facing copy.
     trace = _active_methodology_trace() or {}
     events = trace.setdefault("action_events", [])
     event = {
@@ -1312,6 +1309,14 @@ def list_project_docs(args: dict, **kw) -> str:
     err = _check_project_id(project_id)
     if err:
         return tool_error(err)
+
+    # If the model listed a concrete file path by mistake, read it instead of
+    # failing Invalid directory (common free-chat recovery loop).
+    stripped_list = str(path or "").strip().replace(chr(92), "/").strip("/")
+    if stripped_list and "." in Path(stripped_list).name:
+        file_target = _resolve_project_path(project_id, stripped_list)
+        if file_target is not None:
+            return read_project_doc({"project_id": project_id, "path": stripped_list})
 
     _emit_progress("list", path or ".", phase="started")
     snapshot_cache = _active_workspace_snapshot_cache()
