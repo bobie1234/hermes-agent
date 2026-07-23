@@ -1656,6 +1656,33 @@ def write_project_doc(args: dict, **kw) -> str:
     trace = _active_methodology_trace()
     run_id = str(trace.get("run_id") or "") if trace else ""
 
+    # Progressive outline writes are a run-level contract.  The model may not
+    # collapse all stages into one write or rewrite an earlier stage between
+    # writes; the frontend's progressive view depends on this invariant.
+    outline_action = str(policy.get("action_intent") or "").strip()
+    outline_mode = outline_action.rsplit("_", 1)[-1] if outline_action.startswith("outline_stage_plan_") else ""
+    if (
+        normalized_path == f"outline_variants/{outline_mode}/outline.md"
+        and outline_mode in {"4", "5"}
+        and write_mode == "collect"
+        and isinstance(trace, dict)
+    ):
+        from packages.outline_variants import outline_stage_bodies, validate_progressive_outline_write
+
+        previous_outline = str(trace.get("_progressive_outline_content") or "")
+        valid_outline, outline_error = validate_progressive_outline_write(
+            previous_content=previous_outline,
+            next_content=str(content or ""),
+            mode=outline_mode,
+        )
+        if not valid_outline:
+            _emit_progress("write", normalized_path, phase="failed")
+            return _tool_failure("write_project_doc", project_id, outline_error)
+        trace["_progressive_outline_content"] = str(content or "")
+        trace.setdefault("outline_write_stages", []).append(
+            len(outline_stage_bodies(content, outline_mode))
+        )
+
     if write_mode == "collect":
         if not run_id:
             return _tool_failure(
