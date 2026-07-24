@@ -1882,8 +1882,27 @@ def write_project_doc(args: dict, **kw) -> str:
     )
     _emit_progress("write", normalized_path, phase="completed")
 
+    # SSS / multi-episode collect: do NOT stop the agent turn after the first
+    # episode write. Stopping after each ep makes a 2-episode batch finish with
+    # only one file and then report "本批未写满". stop_current_turn remains for
+    # single-episode non-batch flows if needed later.
+    _action_intent_for_stop = str((active_project_write_policy() or {}).get("action_intent") or "").strip()
+    _multi_episode_batch = False
+    if write_mode == "collect" and normalized_path.startswith("episodes/ep"):
+        _specific = [
+            str(item).replace("\\", "/").strip()
+            for item in ((active_project_write_policy() or {}).get("allowed_specific_writes") or [])
+            if str(item).strip()
+        ]
+        _episode_targets = [p for p in _specific if "/ep" in p and p.endswith(".md")]
+        _multi_episode_batch = len(_episode_targets) > 1 or _action_intent_for_stop in {
+            "workflow2_execute",
+            "preset_execute",
+        }
     _stop_episode_collect_turn = (
-        write_mode == "collect" and normalized_path.startswith("episodes/ep")
+        write_mode == "collect"
+        and normalized_path.startswith("episodes/ep")
+        and not _multi_episode_batch
     )
     return tool_result(
         success=True,
@@ -1896,7 +1915,11 @@ def write_project_doc(args: dict, **kw) -> str:
         message=(
             "剧集候选已收集，当前内层回合立即结束。"
             if _stop_episode_collect_turn
-            else None
+            else (
+                "剧集候选已收集，请继续写本批剩余目标集，不要结束。"
+                if write_mode == "collect" and normalized_path.startswith("episodes/ep")
+                else None
+            )
         ),
     )
 
