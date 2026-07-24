@@ -665,8 +665,13 @@ def _tool_failure(tool_name: str, project_id: str, message: str) -> str:
         and str(policy.get("action_intent") or "") in {"preset_execute", "custom_execute", "workflow2_execute"}
     ):
         _append_unique_trace_list("warnings", f"episode_write_rejected_once: {message}")
-        # 剧集单集回合：第一次写工具失败就结束当前内层回合，禁止 5 次重试。
-        # 外层 orchestrator 继续调度后续集；已成功集不受影响。
+        # Multi-episode SSS/preset: refuse this call but keep the agent turn so
+        # remaining targets can still be written. Single-episode turns still stop.
+        if _is_multi_episode_batch_policy(policy):
+            return tool_error(
+                message + " 请改写或压缩后继续写本批剩余目标集，不要结束回合。",
+                stop_current_turn=False,
+            )
         trace["tool_hard_stop"] = {
             "tool": tool_name,
             "reason": "episode_write_rejected_once",
@@ -774,6 +779,24 @@ def _project_doc_read_satisfies(required_path: str, read_docs: list[str] | tuple
     if required.endswith("/"):
         return any(path.startswith(required) and path != required for path in read_set)
     return False
+
+
+def _is_multi_episode_batch_policy(policy: Optional[dict] = None) -> bool:
+    """True when multi-episode batch must continue after one write fail/success."""
+    pol = policy if isinstance(policy, dict) else (active_project_write_policy() or {})
+    action = str(pol.get("action_intent") or "").strip()
+    if action == "workflow2_execute":
+        return True
+    specific = [
+        str(item).replace("\\", "/").strip()
+        for item in (pol.get("allowed_specific_writes") or [])
+        if str(item).strip()
+    ]
+    episode_targets = [
+        item for item in specific
+        if re.search(r"(?:^|/)ep\d+\.md$", item, re.I)
+    ]
+    return len(episode_targets) > 1
 
 
 def _path_allowed_by_policy(project_id: str, path: str) -> Optional[str]:
@@ -1557,6 +1580,7 @@ def write_project_doc(args: dict, **kw) -> str:
                 return _tool_failure("write_project_doc", project_id, capture_policy_error)
             seen_paths = trace.setdefault("_episode_write_paths_seen", [])
             if normalized_path_for_gate in seen_paths:
+                _dup_stop = not _is_multi_episode_batch_policy(policy)
                 return tool_result(
                     success=True,
                     path=normalized_path_for_gate,
@@ -1564,8 +1588,12 @@ def write_project_doc(args: dict, **kw) -> str:
                     duplicate_ignored=True,
                     accepted=normalized_path_for_gate in (trace.get("project_docs_written") or []),
                     effective_chars=_body_chars,
-                    stop_current_turn=True,
-                    message="本路径本轮已交付，禁止再次生成。",
+                    stop_current_turn=_dup_stop,
+                    message=(
+                        "本路径本轮已交付；请继续写本批其他目标集。"
+                        if not _dup_stop
+                        else "本路径本轮已交付，禁止再次生成。"
+                    ),
                 )
             seen_paths.append(normalized_path_for_gate)
 
@@ -1578,10 +1606,14 @@ def write_project_doc(args: dict, **kw) -> str:
             quality_pack_loaded=bool((trace or {}).get("quality_pack_loaded") or _trace_skills),
             skills_loaded=_trace_skills,
         )
-        # fix_problems may soft-promote non-length issues so repair can land.
-        # workflow2_execute must NOT soft-promote length failures: SSS 字数硬上限 600.
+        # 首次正文是交付，不是质量修订轮。质量结果用于回执和后续检查，
+        # 不能因为字数、场次或格式问题丢掉正文并让模型从零重写同一集。
         _action_intent = str(policy.get("action_intent") or "").strip()
         _soft_promote_intent = _action_intent in {"fix_problems"}
+        _episode_first_delivery = (
+            _action_intent in {"preset_execute", "custom_execute", "workflow2_execute"}
+            and _episode_write_mode == "collect"
+        )
         _length_blocked = any(
             getattr(issue, "code", "") in {"too_long", "too_short"}
             or "有效字数" in str(getattr(issue, "message", "") or "")
@@ -1592,8 +1624,8 @@ def write_project_doc(args: dict, **kw) -> str:
         if _body_chars > _MAX_CHARS:
             _length_blocked = True
         _accepted = (may_promote(_quality) or _soft_promote_intent) and not _length_blocked
-        if _length_blocked and _action_intent == "workflow2_execute":
-            _accepted = False
+        if _episode_first_delivery:
+            _accepted = True
         _episode_attempt_payload = {
             "path": normalized_path_for_gate,
             "phase": "initial",
@@ -1608,11 +1640,12 @@ def write_project_doc(args: dict, **kw) -> str:
                     "warnings",
                     f"episode_quality_rejected:{issue.code}:{normalized_path_for_gate}:{issue.message}",
                 )
-            _reject_msg = (
-                f"有效字数 {_body_chars} 超过上限 {_MAX_CHARS}，请压缩到 400-600 字后再写盘。"
-                if _length_blocked and _body_chars > _MAX_CHARS
-                else "候选正文未通过质量硬门禁，已保留供返修，不得晋升正式正文。"
-            )
+            _reject_msg = "候选正文未通过当前修订质量要求，已保留供返修，不得晋升正式正文。"
+            _rej_stop = not _is_multi_episode_batch_policy(policy)
+            if not _rej_stop:
+                _reject_msg = (
+                    _reject_msg + " 请压缩或改写后继续写本批剩余目标集，不要结束回合。"
+                )
             return tool_result(
                 success=False,
                 path=normalized_path_for_gate,
@@ -1621,9 +1654,9 @@ def write_project_doc(args: dict, **kw) -> str:
                 effective_chars=_body_chars,
                 quality=_quality.to_dict(),
                 message=_reject_msg,
-                stop_current_turn=True,
+                stop_current_turn=_rej_stop,
             )
-        if _soft_promote_intent:
+        if _soft_promote_intent or _episode_first_delivery:
             for issue in _quality.blocking_issues:
                 _append_unique_trace_list(
                     "warnings",
@@ -1886,19 +1919,7 @@ def write_project_doc(args: dict, **kw) -> str:
     # episode write. Stopping after each ep makes a 2-episode batch finish with
     # only one file and then report "本批未写满". stop_current_turn remains for
     # single-episode non-batch flows if needed later.
-    _action_intent_for_stop = str((active_project_write_policy() or {}).get("action_intent") or "").strip()
-    _multi_episode_batch = False
-    if write_mode == "collect" and normalized_path.startswith("episodes/ep"):
-        _specific = [
-            str(item).replace("\\", "/").strip()
-            for item in ((active_project_write_policy() or {}).get("allowed_specific_writes") or [])
-            if str(item).strip()
-        ]
-        _episode_targets = [p for p in _specific if "/ep" in p and p.endswith(".md")]
-        _multi_episode_batch = len(_episode_targets) > 1 or _action_intent_for_stop in {
-            "workflow2_execute",
-            "preset_execute",
-        }
+    _multi_episode_batch = _is_multi_episode_batch_policy()
     _stop_episode_collect_turn = (
         write_mode == "collect"
         and normalized_path.startswith("episodes/ep")
@@ -1911,6 +1932,8 @@ def write_project_doc(args: dict, **kw) -> str:
         original_path=original_path if original_path != path else None,
         bytes=len(content),
         overwritten=True,
+        accepted=True,
+        effective_chars=_episode_effective_chars,
         stop_current_turn=_stop_episode_collect_turn,
         message=(
             "剧集候选已收集，当前内层回合立即结束。"
