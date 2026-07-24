@@ -1578,14 +1578,22 @@ def write_project_doc(args: dict, **kw) -> str:
             quality_pack_loaded=bool((trace or {}).get("quality_pack_loaded") or _trace_skills),
             skills_loaded=_trace_skills,
         )
-        # Fixed-round delivery intents own round semantics: every fixed round
-        # must deliver a draft. until_all_pass decides whether to continue after
-        # delivery. Do not turn a round into a no-write failure.
-        _soft_promote_intent = str(policy.get("action_intent") or "") in {
-            "workflow2_execute",
-            "fix_problems",
-        }
-        _accepted = may_promote(_quality) or _soft_promote_intent
+        # fix_problems may soft-promote non-length issues so repair can land.
+        # workflow2_execute must NOT soft-promote length failures: SSS 字数硬上限 600.
+        _action_intent = str(policy.get("action_intent") or "").strip()
+        _soft_promote_intent = _action_intent in {"fix_problems"}
+        _length_blocked = any(
+            getattr(issue, "code", "") in {"too_long", "too_short"}
+            or "有效字数" in str(getattr(issue, "message", "") or "")
+            for issue in (_quality.blocking_issues or [])
+        )
+        # Also hard-block by measured chars vs contract max 600 for all episode writes.
+        from xiaoma.episode_quality_contract import MAX_EPISODE_CHARS as _MAX_CHARS
+        if _body_chars > _MAX_CHARS:
+            _length_blocked = True
+        _accepted = (may_promote(_quality) or _soft_promote_intent) and not _length_blocked
+        if _length_blocked and _action_intent == "workflow2_execute":
+            _accepted = False
         _episode_attempt_payload = {
             "path": normalized_path_for_gate,
             "phase": "initial",
@@ -1600,6 +1608,11 @@ def write_project_doc(args: dict, **kw) -> str:
                     "warnings",
                     f"episode_quality_rejected:{issue.code}:{normalized_path_for_gate}:{issue.message}",
                 )
+            _reject_msg = (
+                f"有效字数 {_body_chars} 超过上限 {_MAX_CHARS}，请压缩到 400-600 字后再写盘。"
+                if _length_blocked and _body_chars > _MAX_CHARS
+                else "候选正文未通过质量硬门禁，已保留供返修，不得晋升正式正文。"
+            )
             return tool_result(
                 success=False,
                 path=normalized_path_for_gate,
@@ -1607,7 +1620,7 @@ def write_project_doc(args: dict, **kw) -> str:
                 accepted=False,
                 effective_chars=_body_chars,
                 quality=_quality.to_dict(),
-                message="候选正文未通过质量硬门禁，已保留供返修，不得晋升正式正文。",
+                message=_reject_msg,
                 stop_current_turn=True,
             )
         if _soft_promote_intent:
