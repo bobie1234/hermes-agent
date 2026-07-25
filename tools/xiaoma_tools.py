@@ -318,7 +318,7 @@ def clear_active_page():
 def active_page() -> str:
     return _ACTIVE_PAGES_BY_THREAD.get(threading.get_ident(), "")
 
-def _emit_progress(action: str, path: str, *, phase: str = "completed", message: str | None = None):
+def _emit_progress(action: str, path: str, *, phase: str = "completed", message: str | None = None, step_id: str = ""):
     """Emit one structured, user-visible action event for the running task.
 
     Phases: ``started`` (before the tool body), ``completed`` (success),
@@ -328,6 +328,9 @@ def _emit_progress(action: str, path: str, *, phase: str = "completed", message:
     Message copy stays phase-neutral (usually already starts with 正在…);
     the frontend history collapses completed steps and keeps a separate
     "current activity" line for started/failed.
+
+    ``step_id`` groups related events (thinking/started/completed) for the
+    same logical step. Auto-derived from path+action when not provided.
     """
     if _PROGRESS_SINK is None:
         return
@@ -337,12 +340,17 @@ def _emit_progress(action: str, path: str, *, phase: str = "completed", message:
     msg = str(message or "").strip() or _translate_tool_to_progress(action, path)
     if not msg:
         return
+    # Auto-derive step_id: same path+action shares one step
+    resolved_step_id = str(step_id or "").strip()
+    if not resolved_step_id:
+        resolved_step_id = f"{path or action}-{action}"
     # Do not double-prefix 正在/未能: translate already returns user-facing copy.
     trace = _active_methodology_trace() or {}
     events = trace.setdefault("action_events", [])
     event = {
         "type": "action",
         "schema_version": 1,
+        "step_id": resolved_step_id,
         "sequence": len(events) + 1,
         "run_id": str(trace.get("run_id") or ""),
         "action": str(action or ""),
@@ -1609,23 +1617,28 @@ def write_project_doc(args: dict, **kw) -> str:
         # 首次正文是交付，不是质量修订轮。质量结果用于回执和后续检查，
         # 不能因为字数、场次或格式问题丢掉正文并让模型从零重写同一集。
         _action_intent = str(policy.get("action_intent") or "").strip()
+        # fix_problems：交付到 sidecar pending Diff，由用户确认；字数/质量只 advisory。
+        # SSS/preset/custom 首次 collect 同理——首次非空正文就是本轮底稿。
         _soft_promote_intent = _action_intent in {"fix_problems"}
         _episode_first_delivery = (
             _action_intent in {"preset_execute", "custom_execute", "workflow2_execute"}
             and _episode_write_mode == "collect"
         )
+        _delivery_soft = _soft_promote_intent or _episode_first_delivery
         _length_blocked = any(
             getattr(issue, "code", "") in {"too_long", "too_short"}
             or "有效字数" in str(getattr(issue, "message", "") or "")
             for issue in (_quality.blocking_issues or [])
         )
-        # Also hard-block by measured chars vs contract max 600 for all episode writes.
+        # 非交付意图才硬拦超长；fix_problems / SSS 首次交付不得因字数拒写，
+        # 否则会出现「tool completed 但 trace 无写入 → follow-up 空转 → 空气泡」。
         from xiaoma.episode_quality_contract import MAX_EPISODE_CHARS as _MAX_CHARS
         if _body_chars > _MAX_CHARS:
             _length_blocked = True
-        _accepted = (may_promote(_quality) or _soft_promote_intent) and not _length_blocked
-        if _episode_first_delivery:
+        if _delivery_soft:
             _accepted = True
+        else:
+            _accepted = may_promote(_quality) and not _length_blocked
         _episode_attempt_payload = {
             "path": normalized_path_for_gate,
             "phase": "initial",
@@ -1641,6 +1654,11 @@ def write_project_doc(args: dict, **kw) -> str:
                     f"episode_quality_rejected:{issue.code}:{normalized_path_for_gate}:{issue.message}",
                 )
             _reject_msg = "候选正文未通过当前修订质量要求，已保留供返修，不得晋升正式正文。"
+            if _length_blocked and _body_chars > _MAX_CHARS:
+                _reject_msg = (
+                    f"候选正文有效字数 {_body_chars} 超过上限 {_MAX_CHARS}，"
+                    "请压缩后重新写入；本路径尚未交付。"
+                )
             _rej_stop = not _is_multi_episode_batch_policy(policy)
             if not _rej_stop:
                 _reject_msg = (
@@ -1654,13 +1672,20 @@ def write_project_doc(args: dict, **kw) -> str:
                 effective_chars=_body_chars,
                 quality=_quality.to_dict(),
                 message=_reject_msg,
+                error=_reject_msg,
                 stop_current_turn=_rej_stop,
             )
-        if _soft_promote_intent or _episode_first_delivery:
+        if _delivery_soft:
             for issue in _quality.blocking_issues:
                 _append_unique_trace_list(
                     "warnings",
                     f"episode_quality_advisory:{issue.code}:{normalized_path_for_gate}:{issue.message}",
+                )
+            if _length_blocked and _body_chars > _MAX_CHARS:
+                _append_unique_trace_list(
+                    "warnings",
+                    f"episode_length_advisory_over: {normalized_path_for_gate} "
+                    f"({_body_chars} > {_MAX_CHARS})",
                 )
         if _body_chars < MIN_EPISODE_CHARS:
             _append_unique_trace_list(
