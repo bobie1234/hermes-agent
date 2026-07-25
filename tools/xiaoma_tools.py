@@ -618,6 +618,7 @@ def start_methodology_trace(
         "project_docs_written": [],
         "project_docs_listed": [],
         "ledger_docs_read": [],
+        "pending_workspace_writes": [],
         "warnings": [],
         "tool_failure_counts": {},
         "episode_write_attempts": [],
