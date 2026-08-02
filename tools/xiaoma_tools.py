@@ -18,7 +18,7 @@ from html import unescape
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse, parse_qs, unquote
 from urllib.request import Request, urlopen
-from typing import Optional
+from typing import Any, Optional
 from datetime import datetime, timezone
 
 from packages.artifact_canonicalization import (
@@ -26,15 +26,21 @@ from packages.artifact_canonicalization import (
     canonicalize_artifact_content,
 )
 from packages.artifact_contract import ArtifactManifest
+from packages.script_document import (
+    SCRIPT_PATH,
+    ScriptDocumentError,
+    merge_episode_range,
+    parse_script_document,
+    parse_script_target,
+)
 from packages.episode_outline_contract import (
     is_episode_outline_path,
     validate_episode_outline_content,
 )
 from packages.episode_revision_contract import (
-    existing_episode_paths_from_snapshot_cache,
-    normalize_episode_revision_target,
     validate_pending_episode_revision_paths,
 )
+from xiaoma.orchestrator_episode_batches import pending_write_key
 
 
 def _ensure_runtime_root_on_syspath() -> None:
@@ -191,10 +197,6 @@ def _projects_root_for(project_id: str):
 
 _MAX_CARD_CHARS = 5000
 _MAX_CARD_SUMMARY_CHARS = 900
-from xiaoma.episode_quality_contract import (
-    MIN_EPISODE_CHARS,
-    MAX_EPISODE_CHARS,
-)
 _WRITE_POLICIES_BY_THREAD: dict[int, dict] = {}
 _METHODOLOGY_TRACES_BY_THREAD: dict[int, dict] = {}
 
@@ -251,6 +253,8 @@ def _build_artifact_manifest(
     kind: str,
     content: str,
     artifact_id: str = "",
+    episode_range: tuple[int, int] | None = None,
+    stage_range: tuple[int, int] | None = None,
 ) -> ArtifactManifest:
     """Allocate one immutable manifest for collect and direct write events."""
     return ArtifactManifest.create(
@@ -262,6 +266,8 @@ def _build_artifact_manifest(
         path=path,
         kind=kind,
         content=content,
+        episode_range=episode_range,
+        stage_range=stage_range,
     )
 
 
@@ -270,9 +276,8 @@ def _hermes_canonicalization_context(project_id: str) -> CanonicalizationContext
 
     Hermes can read local project files during collect, so the normalizer
     can fill in ``base_content_hash`` / ``old_content`` from the actual
-    episode files on disk. Desktop backend runs do not share the sidecar's
-    workspace directory, so the snapshot cache is the authoritative fallback
-    for the target episode in collect mode.
+    the single screenplay on disk. Desktop backend runs do not share the
+    sidecar's workspace directory, so the snapshot cache is authoritative.
     """
 
     snapshot_cache = _active_workspace_snapshot_cache()
@@ -284,7 +289,7 @@ def _hermes_canonicalization_context(project_id: str) -> CanonicalizationContext
             return str(snapshot_files[normalized] or "")
         resolved = _resolve_project_path(project_id, path)
         if resolved is None or not resolved.exists():
-            raise FileNotFoundError(f"episode file not found: {path}")
+            raise FileNotFoundError(f"project document not found: {path}")
         return resolved.read_text(encoding="utf-8")
 
     def _resolve_file(path: str) -> Optional[str]:
@@ -454,9 +459,35 @@ def _infer_artifact_kind(path: str) -> str:
         return "outline_stage"
     if re.fullmatch(r"outline_variants/[45]/episode_outline\.json", normalized):
         return "episode_outline"
-    if normalized.startswith("episodes/ep") and normalized.endswith(".md"):
+    if normalized == SCRIPT_PATH:
         return "episode_body"
     return "generic"
+
+
+def _script_target_from_policy(policy: dict[str, Any]) -> Any:
+    raw = policy.get("script_target")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return parse_script_target(raw)
+    except ScriptDocumentError:
+        return None
+
+
+def _validate_script_candidate(content: str, policy: dict[str, Any]) -> tuple[str, Any] | None:
+    """Validate that a script write contains exactly the authorized range."""
+
+    target = _script_target_from_policy(policy)
+    if target is None:
+        return None
+    try:
+        document = parse_script_document(content)
+    except ScriptDocumentError:
+        return None
+    expected = tuple(range(target.episode_range.start, target.episode_range.end + 1))
+    if document.episode_ids != expected:
+        return None
+    return content.rstrip("\r\n") + "\n", target
 
 def _current_progress_task_context() -> tuple[str, str]:
     """Return (page, action_intent) for the active run, if known.
@@ -479,9 +510,11 @@ def _describe_doc_path(path: str) -> str:
     p = str(path or "").replace("\\", "/").strip().strip("/")
     if not p:
         return ""
-    m = re.search(r"episodes/ep0*(\d+)", p)
-    if m:
-        return f"第 {int(m.group(1))} 集"
+    if p == SCRIPT_PATH:
+        target = _script_target_from_policy(active_project_write_policy() or {})
+        if target is not None:
+            return target.episode_range.label()
+        return "整部剧稿"
     m = re.search(r"characters/0*(\d+)\.md", p)
     if m:
         return f"人物卡 {int(m.group(1)):02d}"
@@ -623,6 +656,13 @@ def start_methodology_trace(
         "tool_failure_counts": {},
         "episode_write_attempts": [],
     }
+
+
+def set_methodology_trace_field(key: str, value) -> None:
+    """Attach structured runtime metadata to the active tool trace."""
+    trace = _active_methodology_trace()
+    if trace is not None and str(key or "").strip():
+        trace[str(key).strip()] = value
 
 
 def consume_methodology_trace() -> dict:
@@ -796,16 +836,18 @@ def _is_multi_episode_batch_policy(policy: Optional[dict] = None) -> bool:
     action = str(pol.get("action_intent") or "").strip()
     if action == "workflow2_execute":
         return True
+    raw_target = pol.get("script_target")
+    if isinstance(raw_target, dict):
+        try:
+            return parse_script_target(raw_target).episode_range.count > 1
+        except ScriptDocumentError:
+            return False
     specific = [
         str(item).replace("\\", "/").strip()
         for item in (pol.get("allowed_specific_writes") or [])
         if str(item).strip()
     ]
-    episode_targets = [
-        item for item in specific
-        if re.search(r"(?:^|/)ep\d+\.md$", item, re.I)
-    ]
-    return len(episode_targets) > 1
+    return specific.count(SCRIPT_PATH) > 1
 
 
 def _path_allowed_by_policy(project_id: str, path: str) -> Optional[str]:
@@ -1194,35 +1236,6 @@ def _parse_chinese_int(raw: str) -> Optional[int]:
     return None
 
 
-def _episode_number_from_path(path: str) -> Optional[int]:
-    normalized = (path or "").replace("\\", "/")
-    name = Path(normalized).name
-    for pattern in (
-        r"^(?:ep|e)(\d{1,4})\.md$",
-        r"^第\s*(\d{1,4})\s*集\.md$",
-        r"^(\d{1,4})\.md$",
-    ):
-        match = re.search(pattern, name, re.IGNORECASE)
-        if match:
-            value = int(match.group(1))
-            return value if value > 0 else None
-    chinese = re.search(r"^第\s*([零一二两三四五六七八九十百]{1,8})\s*集\.md$", name)
-    if chinese:
-        value = _parse_chinese_int(chinese.group(1))
-        return value if value and value > 0 else None
-    return None
-
-
-def _normalize_episode_doc_path(path: str) -> str:
-    normalized = (path or "").replace("\\", "/")
-    if not normalized.startswith("episodes/"):
-        return path
-    number = _episode_number_from_path(normalized)
-    if number is None:
-        return path
-    return f"episodes/ep{number:03d}.md"
-
-
 _PROJECT_DOC_PATH_ALIASES = {
     "灵感总结.md": "project_brief.md",
     "项目灵感.md": "project_brief.md",
@@ -1244,12 +1257,9 @@ def _canonical_project_doc_path(path: str) -> str:
     return alias if not parent else f"{parent}/{alias}"
 
 
-def _project_doc_sort_key(path: Path) -> tuple[int, int, str]:
-    parent = path.parent.name
-    number = _episode_number_from_path(path.name) if parent == "episodes" else None
-    if number is not None:
-        return (0, number, path.name.lower())
-    return (1, 0, path.name.lower())
+def _project_doc_sort_key(path: Path) -> tuple[int, str]:
+    normalized = path.as_posix().replace("\\", "/").lower()
+    return (0 if normalized == SCRIPT_PATH else 1, normalized)
 
 
 # ---------------------------------------------------------------------------
@@ -1266,7 +1276,14 @@ def read_project_doc(args: dict, **kw) -> str:
     """
     project_id = args.get("project_id", "")
     path = args.get("path", "")
-    path = _normalize_episode_doc_path(_canonical_project_doc_path(path))
+    path = _canonical_project_doc_path(path).replace("\\", "/").strip().lstrip("./")
+
+    if path.startswith("episodes/") and path != SCRIPT_PATH:
+        return _tool_failure(
+            "read_project_doc",
+            project_id,
+            "剧集正文只有一个正式资产，请读取 episodes/script.md。",
+        )
 
     if _is_project_cancelled(project_id):
         return _tool_failure("read_project_doc", project_id, "本轮任务已停止，拒绝继续读取项目内容。")
@@ -1444,7 +1461,14 @@ def list_project_docs(args: dict, **kw) -> str:
     normalized_input = "" if (path or "").strip() in {"", ".", "/", "./", "\\"} else (path or "").strip().replace("\\", "/").strip("/")
     if normalized_input in snapshot_dirs:
         result_files = []
-        for child in sorted(snapshot_dirs.get(normalized_input) or [], key=lambda item: _project_doc_sort_key(Path(str(item.get("path") or "")))):
+        snapshot_children = [
+            child for child in (snapshot_dirs.get(normalized_input) or [])
+            if not (
+                normalized_input.rstrip("/") == "episodes"
+                and str(child.get("path") or "").replace("\\", "/") != SCRIPT_PATH
+            )
+        ]
+        for child in sorted(snapshot_children, key=lambda item: _project_doc_sort_key(Path(str(item.get("path") or "")))):
             item = {
                 "name": str(child.get("name") or Path(str(child.get("path") or "")).name),
                 "path": str(child.get("path") or ""),
@@ -1489,7 +1513,11 @@ def list_project_docs(args: dict, **kw) -> str:
 
     project_root = (_PROJECTS_ROOT / project_id).resolve()
     files = sorted(
-        [child for child in target.iterdir() if child.is_file()],
+        [
+            child for child in target.iterdir()
+            if child.is_file()
+            and not (target.name == "episodes" and child.name != "script.md")
+        ],
         key=_project_doc_sort_key,
     )
     dirs = [
@@ -1543,6 +1571,13 @@ def write_project_doc(args: dict, **kw) -> str:
     path = args.get("path", "")
     content = args.get("content", "")
 
+    if not isinstance(path, str) or not path.strip():
+        return _tool_failure(
+            "write_project_doc",
+            project_id,
+            "项目文档写入 path 不能为空；请使用当前合同指定的正式目标路径。",
+        )
+
     if _is_project_cancelled(project_id):
         return _tool_failure("write_project_doc", project_id, "本轮任务已停止，拒绝继续写入项目内容。")
 
@@ -1562,15 +1597,38 @@ def write_project_doc(args: dict, **kw) -> str:
     # paths before WritePolicy checks, otherwise a correct stage write can be
     # rejected only because the model chose the display name.
     original_path = path
-    path = _normalize_episode_doc_path(_canonical_project_doc_path(path))
+    path = _canonical_project_doc_path(path).replace("\\", "/").strip().lstrip("./")
     policy = active_project_write_policy() or {}
-    # 剧集首次非空提交就是交付底稿。字数只记录质量提示，不拒写、不重写。
+    if path.startswith("episodes/") and path != SCRIPT_PATH:
+        return _tool_failure(
+            "write_project_doc",
+            project_id,
+            "剧集正文只有一个正式目标，必须写入 episodes/script.md 并携带逻辑集范围。",
+        )
+    # Every screenplay candidate must pass the shared write-time gate before
+    # it can enter the formal artifact pipeline.
     _episode_effective_chars: int | None = None
     _episode_attempt_payload: dict | None = None
-    if isinstance(content, str) and path.startswith("episodes/ep"):
+    _episode_target = None
+    if isinstance(content, str) and path == SCRIPT_PATH:
         content, _discarded_contract = _strip_episode_contract_block(content)
         if not content.strip():
             return _tool_failure("write_project_doc", project_id, "剧集正文为空，无法写入。")
+        _validated_script = _validate_script_candidate(content, policy)
+        if _validated_script is None:
+            expected_target = _script_target_from_policy(policy)
+            range_detail = (
+                f"本轮目标为{expected_target.episode_range.label()}。"
+                if expected_target is not None
+                else "当前写策略缺少有效 script_target。"
+            )
+            return _tool_failure(
+                "write_project_doc",
+                project_id,
+                "剧稿候选必须只包含系统指定的连续集范围，并使用独立一行的第N集标题。"
+                + range_detail,
+            )
+        content, _episode_target = _validated_script
         normalized_path_for_gate = _normalize_project_doc_trace_path(path)
         _body_for_count = re.sub(r"```.*?```", "", content, flags=re.DOTALL)
         _body_for_count = re.sub(r"^\s*#+\s*", "", _body_for_count, flags=re.MULTILINE)
@@ -1587,8 +1645,16 @@ def write_project_doc(args: dict, **kw) -> str:
             capture_policy_error = _path_allowed_by_policy(project_id, path)
             if capture_policy_error:
                 return _tool_failure("write_project_doc", project_id, capture_policy_error)
-            seen_paths = trace.setdefault("_episode_write_paths_seen", [])
-            if normalized_path_for_gate in seen_paths:
+            seen_keys = trace.setdefault("_episode_write_keys_seen", [])
+            episode_key = pending_write_key(
+                {
+                    "path": normalized_path_for_gate,
+                    "episode_range": _episode_target.episode_range.as_list()
+                    if _episode_target is not None
+                    else None,
+                }
+            )
+            if episode_key in seen_keys:
                 _dup_stop = not _is_multi_episode_batch_policy(policy)
                 return tool_result(
                     success=True,
@@ -1604,7 +1670,7 @@ def write_project_doc(args: dict, **kw) -> str:
                         else "本路径本轮已交付，禁止再次生成。"
                     ),
                 )
-            seen_paths.append(normalized_path_for_gate)
+            seen_keys.append(episode_key)
 
         from packages.quality.candidate_gate import evaluate_episode_candidate, may_promote
 
@@ -1615,31 +1681,10 @@ def write_project_doc(args: dict, **kw) -> str:
             quality_pack_loaded=bool((trace or {}).get("quality_pack_loaded") or _trace_skills),
             skills_loaded=_trace_skills,
         )
-        # 首次正文是交付，不是质量修订轮。质量结果用于回执和后续检查，
-        # 不能因为字数、场次或格式问题丢掉正文并让模型从零重写同一集。
-        _action_intent = str(policy.get("action_intent") or "").strip()
-        # fix_problems：交付到 sidecar pending Diff，由用户确认；字数/质量只 advisory。
-        # SSS/preset/custom 首次 collect 同理——首次非空正文就是本轮底稿。
-        _soft_promote_intent = _action_intent in {"fix_problems"}
-        _episode_first_delivery = (
-            _action_intent in {"preset_execute", "custom_execute", "workflow2_execute"}
-            and _episode_write_mode == "collect"
-        )
-        _delivery_soft = _soft_promote_intent or _episode_first_delivery
-        _length_blocked = any(
-            getattr(issue, "code", "") in {"too_long", "too_short"}
-            or "有效字数" in str(getattr(issue, "message", "") or "")
-            for issue in (_quality.blocking_issues or [])
-        )
-        # 非交付意图才硬拦超长；fix_problems / SSS 首次交付不得因字数拒写，
-        # 否则会出现「tool completed 但 trace 无写入 → follow-up 空转 → 空气泡」。
-        from xiaoma.episode_quality_contract import MAX_EPISODE_CHARS as _MAX_CHARS
-        if _body_chars > _MAX_CHARS:
-            _length_blocked = True
-        if _delivery_soft:
-            _accepted = True
-        else:
-            _accepted = may_promote(_quality) and not _length_blocked
+        # All episode intents use the same candidate gate. A first draft is
+        # not a special delivery state: an unqualified candidate cannot enter
+        # the formal artifact pipeline and must follow the bounded retry path.
+        _accepted = may_promote(_quality)
         _episode_attempt_payload = {
             "path": normalized_path_for_gate,
             "phase": "initial",
@@ -1655,10 +1700,18 @@ def write_project_doc(args: dict, **kw) -> str:
                     f"episode_quality_rejected:{issue.code}:{normalized_path_for_gate}:{issue.message}",
                 )
             _reject_msg = "候选正文未通过当前修订质量要求，已保留供返修，不得晋升正式正文。"
-            if _length_blocked and _body_chars > _MAX_CHARS:
+            _length_issue = next(
+                (
+                    issue
+                    for issue in _quality.blocking_issues
+                    if issue.code in {"length_under", "length_over"}
+                ),
+                None,
+            )
+            if _length_issue is not None:
                 _reject_msg = (
-                    f"候选正文有效字数 {_body_chars} 超过上限 {_MAX_CHARS}，"
-                    "请压缩后重新写入；本路径尚未交付。"
+                    f"候选正文未通过字数 Gate：{_length_issue.message}"
+                    " 请压缩或补足后重新写入；本路径尚未交付。"
                 )
             _rej_stop = not _is_multi_episode_batch_policy(policy)
             if not _rej_stop:
@@ -1676,36 +1729,19 @@ def write_project_doc(args: dict, **kw) -> str:
                 error=_reject_msg,
                 stop_current_turn=_rej_stop,
             )
-        if _delivery_soft:
-            for issue in _quality.blocking_issues:
-                _append_unique_trace_list(
-                    "warnings",
-                    f"episode_quality_advisory:{issue.code}:{normalized_path_for_gate}:{issue.message}",
-                )
-            if _length_blocked and _body_chars > _MAX_CHARS:
-                _append_unique_trace_list(
-                    "warnings",
-                    f"episode_length_advisory_over: {normalized_path_for_gate} "
-                    f"({_body_chars} > {_MAX_CHARS})",
-                )
-        if _body_chars < MIN_EPISODE_CHARS:
-            _append_unique_trace_list(
-                "warnings",
-                f"episode_length_advisory_under: {normalized_path_for_gate} "
-                f"({_body_chars} < {MIN_EPISODE_CHARS})",
-            )
-        elif _body_chars > MAX_EPISODE_CHARS:
-            _append_unique_trace_list(
-                "warnings",
-                f"episode_length_advisory_over: {normalized_path_for_gate} "
-                f"({_body_chars} > {MAX_EPISODE_CHARS})",
-            )
         # 波别要求：剧集正文严禁破折号「——」（DeepSeek 强写、SKILL/prompt 都管不住），
         # 写盘兜底：把「——」替换成全角逗号（对白/动作的连接停顿用逗号，语义无损）。
         content = content.replace("——", "，")
-        # 波别要求：△ 动作符号必须顶格行首，不能跟在对白后面同一行。
-        # 写盘兜底：把非行首的 △ 前插入换行，确保每个 △ 都是行首。
-        content = re.sub(r"(?<!\n)(?<=.)([ \t]*)(?=△)", "\n", content)
+        # 波别要求：△ 动作符号必须顶格行首，不能跟在对白后面同一行，且动作块
+        # 前必须空一行。写盘兜底：同时识别 ▲（模型常写）与 △。
+        # ① 同一行内跟在其它文字后的动作标记 → 拆成独立行并前插空行；
+        # ② 已是行首但前一行为非空（无空行分隔）→ 补一个空行；
+        # ③ 去掉动作标记前的行首空格。
+        content = re.sub(r"^[ \t]+(?=[▲△])", "", content, flags=re.MULTILINE)
+        content = re.sub(r"(?<=.)[ \t]*(?=[▲△])", "\n\n", content)
+        content = re.sub(r"\n{3,}", "\n\n", content)
+        # 已是行首但前一行为非空（无空行分隔）→ 补一个空行
+        content = re.sub(r"(?<=[^\n])\n(?=[▲△])", "\n\n", content)
     # ──────────────────────────────────────────────────────────────────
 
     _emit_progress("write", path, phase="started")
@@ -1741,7 +1777,11 @@ def write_project_doc(args: dict, **kw) -> str:
     ):
         from packages.outline_variants import outline_stage_bodies, validate_progressive_outline_write
 
-        previous_outline = str(trace.get("_progressive_outline_content") or "")
+        previous_outline = str(
+            trace.get("_progressive_outline_content")
+            or policy.get("progressive_outline_seed")
+            or ""
+        )
         valid_outline, outline_error = validate_progressive_outline_write(
             previous_content=previous_outline,
             next_content=str(content or ""),
@@ -1773,25 +1813,19 @@ def write_project_doc(args: dict, **kw) -> str:
             normalized_path == "ledger/pending_episode_revisions.json"
             and str(policy.get("action_intent") or "").strip() == "episode_rewrite"
         ):
-            existing_paths = list(
-                existing_episode_paths_from_snapshot_cache(
-                    policy.get("workspace_snapshot_cache")
+            script_file = _PROJECTS_ROOT / project_id / Path(SCRIPT_PATH)
+            try:
+                script_content = script_file.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                return _tool_failure(
+                    "write_project_doc",
+                    project_id,
+                    f"读取整部剧稿失败，不能生成单集修改记录：{exc}",
                 )
-            )
-            project_root = _PROJECTS_ROOT / project_id / "episodes"
-            if project_root.exists():
-                for child in project_root.iterdir():
-                    if not child.is_file():
-                        continue
-                    episode_path = normalize_episode_revision_target(
-                        f"episodes/{child.name}"
-                    )
-                    if episode_path and episode_path not in existing_paths:
-                        existing_paths.append(episode_path)
-            existing_paths = sorted(set(existing_paths))
             path_error = validate_pending_episode_revision_paths(
                 content,
-                existing_episode_paths=existing_paths,
+                script_content=script_content,
+                expected_target=policy.get("script_target"),
             )
             if path_error:
                 return _tool_failure("write_project_doc", project_id, path_error)
@@ -1838,15 +1872,19 @@ def write_project_doc(args: dict, **kw) -> str:
                 path=normalized_path,
                 kind=_infer_artifact_kind(path),
                 content=_canonical_content,
+                episode_range=(
+                    (_episode_target.episode_range.start, _episode_target.episode_range.end)
+                    if _episode_target is not None else None
+                ),
+                stage_range=(
+                    (_episode_target.stage_range.start, _episode_target.stage_range.end)
+                    if _episode_target is not None and _episode_target.stage_range is not None else None
+                ),
             )
         except ValueError as exc:
             return _tool_failure("write_project_doc", project_id, f"invalid artifact manifest: {exc}")
         if trace is not None:
             pending = trace.setdefault("pending_workspace_writes", [])
-            existing = next(
-                (item for item in pending if str(item.get("path") or "") == normalized_path),
-                None,
-            )
             payload = _manifest.to_pending_write(_canonical_content)
             if _episode_attempt_payload is not None:
                 payload.update(
@@ -1856,6 +1894,11 @@ def write_project_doc(args: dict, **kw) -> str:
                         "effective_chars": _episode_attempt_payload["effective_chars"],
                     }
                 )
+            payload_key = pending_write_key(payload)
+            existing = next(
+                (item for item in pending if pending_write_key(item) == payload_key),
+                None,
+            )
             if existing is None:
                 pending.append(payload)
             else:
@@ -1864,37 +1907,17 @@ def write_project_doc(args: dict, **kw) -> str:
                 trace.setdefault("episode_write_attempts", []).append(_episode_attempt_payload)
         _emit_artifact_ready(project_id, normalized_path, _canonical_content, manifest=_manifest)
     else:
-        # B-EPISODE-BACKUP-01：写入剧集文件前先备份旧版本。
-        # 检查目标文件是否存在，如果存在则复制为 .v{N} 版本文件。
-        # 版本号从 1 开始递增，保留所有历史版本供前端对比。
-        if path.startswith("episodes/ep"):
-            try:
-                if target.exists() and target.stat().st_size > 0:
-                    old_content = target.read_text(encoding="utf-8")
-                    # 扫描已有版本文件确定下一个版本号
-                    version_num = 1
-                    for sibling in target.parent.iterdir():
-                        sibling_name = sibling.name
-                        if sibling_name.startswith(target.stem) and sibling_name.endswith(".md"):
-                            v_match = re.search(r"\.v(\d+)\.md$", sibling_name)
-                            if v_match:
-                                version_num = max(version_num, int(v_match.group(1)) + 1)
-                    # 如果主文件本身也是某个版本（如 ep001.md.v2.md 格式），
-                    # 以上扫描已覆盖。此处备份前一份内容。
-                    backup_name = f"{target.stem}.v{version_num}.md"
-                    backup_path = target.parent / backup_name
-                    backup_path.write_text(old_content, encoding="utf-8")
-                    _append_unique_trace_list("warnings",
-                        f"episode_backup: {normalized_path} -> {backup_name}")
-            except Exception as _backup_exc:
-                # 备份失败不影响主流程，仅记录 warning
-                _append_unique_trace_list("warnings",
-                    f"episode_backup_failed: {normalized_path}: {_backup_exc}")
-
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
-            written_back = target.read_text(encoding="utf-8")
+            if _episode_target is not None:
+                existing_content = target.read_text(encoding="utf-8") if target.exists() else ""
+                content = merge_episode_range(existing_content, _episode_target.episode_range, content)
+            from packages.atomic_file import replace_atomic
+            from packages.workspace_text import decode_workspace_bytes, normalize_workspace_text
+
+            content = normalize_workspace_text(content)
+            replace_atomic(target, content.encode("utf-8"))
+            written_back = decode_workspace_bytes(target.read_bytes())
         except OSError as exc:
             return _tool_failure("write_project_doc", project_id, f"Write error: {exc}")
         except Exception as exc:
@@ -1905,18 +1928,6 @@ def write_project_doc(args: dict, **kw) -> str:
                 project_id,
                 f"Write verification failed: {normalized_path}",
             )
-
-        # A-EPISODE-NUMBER-TRUTH-SOURCE-01 §方案B：写入 episode 文件后自动更新 episode_index.json
-        if path.startswith("episodes/ep"):
-            try:
-                import re as _re_ep
-                from xiaoma.episode_index import EpisodeIndexManager as _EIM
-                ep_match = _re_ep.search(r"ep0*(\d+)\.md$", path)
-                if ep_match and project_id and _PROJECTS_ROOT is not None:
-                    _EIM((_PROJECTS_ROOT / project_id).resolve()).add_episode(int(ep_match.group(1)))
-            except Exception as _idx_exc:
-                # 索引更新失败不影响主流程，仅记录 warning
-                _append_unique_trace_list("warnings", f"episode_index_update_failed: {path}: {_idx_exc}")
 
         # Direct write mode — construct manifest ONCE for the commit event
         if run_id:
@@ -1930,6 +1941,14 @@ def write_project_doc(args: dict, **kw) -> str:
                     path=normalized_path,
                     kind=_infer_artifact_kind(path),
                     content=content,
+                    episode_range=(
+                        (_episode_target.episode_range.start, _episode_target.episode_range.end)
+                        if _episode_target is not None else None
+                    ),
+                    stage_range=(
+                        (_episode_target.stage_range.start, _episode_target.stage_range.end)
+                        if _episode_target is not None and _episode_target.stage_range is not None else None
+                    ),
                 )
             except ValueError as exc:
                 return _tool_failure("write_project_doc", project_id, f"invalid artifact manifest: {exc}")
@@ -1948,7 +1967,7 @@ def write_project_doc(args: dict, **kw) -> str:
     _multi_episode_batch = _is_multi_episode_batch_policy()
     _stop_episode_collect_turn = (
         write_mode == "collect"
-        and normalized_path.startswith("episodes/ep")
+        and normalized_path == SCRIPT_PATH
         and not _multi_episode_batch
     )
     return tool_result(
@@ -1966,7 +1985,7 @@ def write_project_doc(args: dict, **kw) -> str:
             if _stop_episode_collect_turn
             else (
                 "剧集候选已收集，请继续写本批剩余目标集，不要结束。"
-                if write_mode == "collect" and normalized_path.startswith("episodes/ep")
+                if write_mode == "collect" and normalized_path == SCRIPT_PATH
                 else None
             )
         ),
@@ -2396,7 +2415,7 @@ registry.register(
                 },
                 "episode_contract": {
                     "type": "object",
-                    "description": "Optional structured prewrite contract for episodes/ep*.md writes. Must include scene_plan, opening_conflict, protagonist_goal, ending_hook, target_chars_min, target_chars_max, os_budget.",
+                    "description": "Optional structured prewrite contract for the requested logical episode range in episodes/script.md. Must include scene_plan, opening_conflict, protagonist_goal, ending_hook, target_chars_min, target_chars_max, os_budget.",
                 },
             },
             "required": ["project_id", "path", "content"],
