@@ -1621,6 +1621,12 @@ def write_project_doc(args: dict, **kw) -> str:
     path = args.get("path", "")
     content = args.get("content", "")
 
+    # Episode duplicate-guard state, initialized at function scope so the
+    # canonicalize-time check (after the SCRIPT_PATH block) can safely read it
+    # even when this write is NOT episodes/script.md (e.g. pending revisions).
+    _episode_seen_keys: list | None = None
+    _episode_key: str | None = None
+
     if not isinstance(path, str) or not path.strip():
         return _tool_failure(
             "write_project_doc",
@@ -1704,23 +1710,13 @@ def write_project_doc(args: dict, **kw) -> str:
                     else None,
                 }
             )
-            if episode_key in seen_keys:
-                _dup_stop = not _is_multi_episode_batch_policy(policy)
-                return tool_result(
-                    success=True,
-                    path=normalized_path_for_gate,
-                    normalized_path=normalized_path_for_gate,
-                    duplicate_ignored=True,
-                    accepted=normalized_path_for_gate in (trace.get("project_docs_written") or []),
-                    effective_chars=_body_chars,
-                    stop_current_turn=_dup_stop,
-                    message=(
-                        "本路径本轮已交付；请继续写本批其他目标集。"
-                        if not _dup_stop
-                        else "本路径本轮已交付，禁止再次生成。"
-                    ),
-                )
-            seen_keys.append(episode_key)
+            # Defer marking the path as "already delivered" until the candidate
+            # actually PASSES the quality gate and its pending write is recorded.
+            # Recording seen at this point (before quality) makes a rejected
+            # rewrite of the same episode look like a duplicate → the model's
+            # correction attempt is ignored → wrote-no-docs follow-up loop.
+            _episode_seen_keys = seen_keys
+            _episode_key = episode_key
 
         from packages.quality.candidate_gate import evaluate_episode_candidate, may_promote
 
@@ -1912,6 +1908,28 @@ def write_project_doc(args: dict, **kw) -> str:
                 "本次修订至少要生成一条待确认修改记录，不能写入空修改清单。",
             )
 
+        # Duplicate guard is evaluated only after the candidate passed quality.
+        # A same-episode rewrite is only "already delivered" once a previous
+        # candidate actually landed in pending_workspace_writes.
+        if _episode_key is not None and _episode_seen_keys is not None:
+            if _episode_key in _episode_seen_keys:
+                _dup_stop = not _is_multi_episode_batch_policy(policy)
+                return tool_result(
+                    success=True,
+                    path=normalized_path_for_gate,
+                    normalized_path=normalized_path_for_gate,
+                    duplicate_ignored=True,
+                    accepted=normalized_path_for_gate in (trace.get("project_docs_written") or []) if trace is not None else False,
+                    effective_chars=_body_chars,
+                    stop_current_turn=_dup_stop,
+                    message=(
+                        "本路径本轮已交付；请继续写本批其他目标集。"
+                        if not _dup_stop
+                        else "本路径本轮已交付，禁止再次生成。"
+                    ),
+                )
+            _episode_seen_keys.append(_episode_key)
+
         _seq = _next_artifact_sequence(run_id)
         try:
             _manifest = _build_artifact_manifest(
@@ -1936,6 +1954,7 @@ def write_project_doc(args: dict, **kw) -> str:
         if trace is not None:
             pending = trace.setdefault("pending_workspace_writes", [])
             payload = _manifest.to_pending_write(_canonical_content)
+
             if _episode_attempt_payload is not None:
                 payload.update(
                     {
