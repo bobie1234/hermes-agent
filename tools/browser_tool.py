@@ -1234,8 +1234,11 @@ def _reap_orphaned_browser_sessions():
                 owner_pid = int(Path(owner_pid_file).read_text(encoding="utf-8").strip())
                 # ``os.kill(pid, 0)`` is NOT a no-op on Windows (bpo-14484).
                 # Use the cross-platform existence check.
-                from gateway.status import _pid_exists
-                owner_alive = _pid_exists(owner_pid)
+                try:
+                    from gateway.status import _pid_exists
+                    owner_alive = _pid_exists(owner_pid)
+                except Exception:
+                    owner_alive = None  # gateway.status removed — cannot check
             except (ValueError, OSError):
                 owner_alive = None  # corrupt file — fall through
 
@@ -1264,8 +1267,12 @@ def _reap_orphaned_browser_sessions():
 
         # Check if the daemon is still alive. ``os.kill(pid, 0)`` on Windows
         # is NOT a no-op — use the handle-based existence check.
-        from gateway.status import _pid_exists
-        if not _pid_exists(daemon_pid):
+        try:
+            from gateway.status import _pid_exists
+            daemon_alive = _pid_exists(daemon_pid)
+        except Exception:
+            daemon_alive = True  # cannot check (gateway.status removed) — don't reap
+        if not daemon_alive:
             shutil.rmtree(socket_dir, ignore_errors=True)
             continue
 

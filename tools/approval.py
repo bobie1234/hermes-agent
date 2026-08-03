@@ -80,7 +80,10 @@ def get_current_session_key(default: str = "default") -> str:
     session_key = _approval_session_key.get()
     if session_key:
         return session_key
-    from gateway.session_context import get_session_env
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return os.getenv("HERMES_SESSION_KEY", default)
     return get_session_env("HERMES_SESSION_KEY", default)
 
 

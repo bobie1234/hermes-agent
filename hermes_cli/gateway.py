@@ -16,12 +16,24 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
-from gateway.status import terminate_pid
-from gateway.restart import (
-    DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
-    GATEWAY_SERVICE_RESTART_EXIT_CODE,
-    parse_restart_drain_timeout,
-)
+try:
+    from gateway.status import terminate_pid
+    from gateway.restart import (
+        DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+        GATEWAY_SERVICE_RESTART_EXIT_CODE,
+        parse_restart_drain_timeout,
+    )
+except Exception:
+    # gateway package removed (Phase 7): only the gateway CLI subcommands use
+    # these names, and those subcommands are non-functional without it. Stub
+    # so the module still imports.
+    terminate_pid = None
+    DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT = 30
+    GATEWAY_SERVICE_RESTART_EXIT_CODE = 75
+
+    def parse_restart_drain_timeout(raw):  # type: ignore[no-redef]
+        return DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+
 from hermes_cli.config import (
     get_env_value,
     get_hermes_home,

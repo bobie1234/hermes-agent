@@ -240,7 +240,10 @@ def _handle_send(args):
         else:
             return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
 
-    from gateway.platforms.base import BasePlatformAdapter
+    try:
+        from gateway.platforms.base import BasePlatformAdapter
+    except Exception as e:
+        return json.dumps(_error(f"Gateway platform adapters unavailable: {e}"))
 
     # Capture [[as_document]] directive before extract_media strips it.
     # Image-extension files in this batch will route through send_document
@@ -382,17 +385,20 @@ def _describe_media_for_mirror(media_files):
 
 def _get_cron_auto_delivery_target():
     """Return the cron scheduler's auto-delivery target for the current run, if any."""
-    from gateway.session_context import get_session_env
-    platform = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip().lower()
-    chat_id = get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip()
-    if not platform or not chat_id:
+    try:
+        from gateway.session_context import get_session_env
+        platform = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip().lower()
+        chat_id = get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip()
+        if not platform or not chat_id:
+            return None
+        thread_id = get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "").strip() or None
+        return {
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+        }
+    except Exception:
         return None
-    thread_id = get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "").strip() or None
-    return {
-        "platform": platform,
-        "chat_id": chat_id,
-        "thread_id": thread_id,
-    }
 
 
 def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id: str | None):
@@ -522,10 +528,13 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     using the same smart-splitting algorithm as the gateway adapters
     (preserves code-block boundaries, adds part indicators).
     """
-    from gateway.config import Platform
-    from gateway.platforms.base import BasePlatformAdapter, utf16_len
-    from gateway.platforms.discord import DiscordAdapter
-    from gateway.platforms.slack import SlackAdapter
+    try:
+        from gateway.config import Platform
+        from gateway.platforms.base import BasePlatformAdapter, utf16_len
+        from gateway.platforms.discord import DiscordAdapter
+        from gateway.platforms.slack import SlackAdapter
+    except Exception as e:
+        return {"error": f"Gateway platform adapters unavailable: {e}"}
 
     # Telegram adapter import is optional (requires python-telegram-bot)
     try:
@@ -1189,16 +1198,19 @@ async def _send_signal(extra, chat_id, message, media_files=None):
     except ImportError:
         return {"error": "httpx not installed"}
 
-    from gateway.platforms.signal_rate_limit import (
-        SIGNAL_BATCH_PACING_NOTICE_THRESHOLD,
-        SIGNAL_MAX_ATTACHMENTS_PER_MSG,
-        SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
-        _extract_retry_after_seconds,
-        _format_wait,
-        _is_signal_rate_limit_error,
-        _signal_send_timeout,
-        get_scheduler,
-    )
+    try:
+        from gateway.platforms.signal_rate_limit import (
+            SIGNAL_BATCH_PACING_NOTICE_THRESHOLD,
+            SIGNAL_MAX_ATTACHMENTS_PER_MSG,
+            SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
+            _extract_retry_after_seconds,
+            _format_wait,
+            _is_signal_rate_limit_error,
+            _signal_send_timeout,
+            get_scheduler,
+        )
+    except Exception as e:
+        return {"error": f"Signal rate-limit module unavailable: {e}"}
 
     try:
         http_url = extra.get("http_url", "http://127.0.0.1:8080").rstrip("/")
@@ -1775,10 +1787,13 @@ def _check_send_message():
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
         return True
-    from gateway.session_context import get_session_env
-    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-    if platform and platform != "local":
-        return True
+    try:
+        from gateway.session_context import get_session_env
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        if platform and platform != "local":
+            return True
+    except Exception:
+        pass
     try:
         from gateway.status import is_gateway_running
         return is_gateway_running()

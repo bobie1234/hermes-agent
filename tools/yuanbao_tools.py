@@ -176,7 +176,14 @@ async def search_sticker(query: str = "", limit: int = 10) -> dict:
     返回每条候选的 sticker_id / name / description / package_id，
     供 LLM 选择后传给 send_sticker。空 query 时返回前 N 条。
     """
-    from gateway.platforms.yuanbao_sticker import search_stickers
+    try:
+        from gateway.platforms.yuanbao_sticker import search_stickers
+    except Exception as exc:
+        logger.warning("[yuanbao_tools] yuanbao_sticker unavailable: %s", exc)
+        return {
+            "success": False,
+            "error": "yuanbao sticker module unavailable (gateway plugins not installed)",
+        }
 
     try:
         safe_limit = max(1, min(50, int(limit) if limit else 10))
@@ -221,12 +228,19 @@ async def send_sticker(
 
     Returns: ``{"success": bool, ...}``
     """
-    from gateway.session_context import get_session_env
-    from gateway.platforms.yuanbao_sticker import (
-        get_sticker_by_id,
-        get_sticker_by_name,
-        get_random_sticker,
-    )
+    try:
+        from gateway.session_context import get_session_env
+        from gateway.platforms.yuanbao_sticker import (
+            get_sticker_by_id,
+            get_sticker_by_name,
+            get_random_sticker,
+        )
+    except Exception as exc:
+        logger.warning("[yuanbao_tools] yuanbao_sticker unavailable: %s", exc)
+        return {
+            "success": False,
+            "error": "yuanbao sticker features unavailable (gateway plugins not installed)",
+        }
 
     target = (chat_id or "").strip() or get_session_env("HERMES_SESSION_CHAT_ID", "")
     if not target:
@@ -468,8 +482,11 @@ async def _handle_yb_send_dm(args, **kw):
     # Extract MEDIA:<path> tags embedded in the message text (LLM often puts
     # file paths there instead of using the media_files parameter).
     message = args.get("message", "")
-    from gateway.platforms.base import BasePlatformAdapter
-    embedded_media, message = BasePlatformAdapter.extract_media(message)
+    try:
+        from gateway.platforms.base import BasePlatformAdapter
+        embedded_media, message = BasePlatformAdapter.extract_media(message)
+    except Exception:
+        embedded_media = []
     if embedded_media:
         media_files.extend(embedded_media)
 

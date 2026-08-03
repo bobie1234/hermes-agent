@@ -47,7 +47,16 @@ from hermes_cli.config import (
     check_config_version,
     redact_key,
 )
-from gateway.status import get_running_pid, read_runtime_status
+try:
+    from gateway.status import get_running_pid, read_runtime_status
+except Exception:
+    # gateway package removed (Phase 7): the dashboard's gateway-liveness
+    # checks degrade to "not running" / "no runtime status".
+    def get_running_pid():  # type: ignore[no-redef]
+        return None
+
+    def read_runtime_status():  # type: ignore[no-redef]
+        return None
 
 try:
     from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect

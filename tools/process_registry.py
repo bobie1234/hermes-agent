@@ -406,7 +406,10 @@ class ProcessRegistry:
             return False
         # ``os.kill(pid, 0)`` is NOT a no-op on Windows (bpo-14484) — use
         # the cross-platform existence check.
-        from gateway.status import _pid_exists
+        try:
+            from gateway.status import _pid_exists
+        except Exception:
+            return True  # cannot check (gateway.status removed) — assume alive
         return _pid_exists(pid)
 
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
