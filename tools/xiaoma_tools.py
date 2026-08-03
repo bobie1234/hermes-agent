@@ -671,7 +671,20 @@ def consume_methodology_trace() -> dict:
 
 
 def _active_methodology_trace() -> Optional[dict]:
-    return _METHODOLOGY_TRACES_BY_THREAD.get(threading.get_ident())
+    trace = _METHODOLOGY_TRACES_BY_THREAD.get(threading.get_ident())
+    if trace is not None:
+        return trace
+    # Hermes runs concurrent tool calls in ThreadPoolExecutor workers; those
+    # worker threads have a different ident and never see the trace the main
+    # thread registered. Fall back to the most recently started trace so
+    # collect-mode writes from a worker are still recorded instead of silently
+    # dropped (which made the orchestrator think "wrote no docs" and forced
+    # follow-up retries → dead loop + wasted spend).
+    fallback = None
+    for tid, candidate in reversed(tuple(_METHODOLOGY_TRACES_BY_THREAD.items())):
+        fallback = candidate
+        break
+    return fallback
 
 
 def _append_unique_trace_list(key: str, value) -> None:
