@@ -321,7 +321,16 @@ def clear_active_page():
     _ACTIVE_PAGES_BY_THREAD.pop(threading.get_ident(), None)
 
 def active_page() -> str:
-    return _ACTIVE_PAGES_BY_THREAD.get(threading.get_ident(), "")
+    page = _ACTIVE_PAGES_BY_THREAD.get(threading.get_ident(), "")
+    if page:
+        return page
+    # Hermes runs concurrent tool calls in worker threads; they don't see the
+    # page the main thread registered. Fall back to the most recently set page
+    # so formal artifact manifest construction in a worker doesn't fail with
+    # "page is required".
+    for tid, candidate in reversed(tuple(_ACTIVE_PAGES_BY_THREAD.items())):
+        return candidate
+    return ""
 
 def _emit_progress(action: str, path: str, *, phase: str = "completed", message: str | None = None, step_id: str = ""):
     """Emit one structured, user-visible action event for the running task.
