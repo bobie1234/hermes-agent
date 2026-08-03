@@ -199,6 +199,11 @@ _MAX_CARD_CHARS = 5000
 _MAX_CARD_SUMMARY_CHARS = 900
 _WRITE_POLICIES_BY_THREAD: dict[int, dict] = {}
 _METHODOLOGY_TRACES_BY_THREAD: dict[int, dict] = {}
+# run_id → trace: lets ThreadPoolExecutor worker threads (which have a
+# different ident and never see the main thread's registration) reach the same
+# trace dict, and lets a follow-up start for the same run reuse the collected
+# writes instead of replacing them with a fresh empty trace.
+_METHODOLOGY_TRACES_BY_RUN: dict[str, dict] = {}
 
 # A-EXECUTE-REALTIME-PROGRESS-SSE-01：进度 hook（agent 工具调用时触发）
 # orchestrator 注册一个回调，工具调用时推进度给前端（通过 SSE）
@@ -646,9 +651,24 @@ def start_methodology_trace(
     page: str,
     expected_skills: list[str] | None = None,
 ) -> None:
-    """Start a per-thread methodology trace for one Hermes run."""
+    """Start a per-thread methodology trace for one Hermes run.
+
+    The trace is ALSO registered under a global run_id → trace map so worker
+    threads (Hermes runs tools in ThreadPoolExecutor workers, which have a
+    different ident and never see the main thread's registration) can reach the
+    same dict object. A follow-up start for the same run_id REUSES the existing
+    trace (keeps already-collected writes) instead of replacing it with a fresh
+    empty one — that is what made collect-mode writes appear "lost" and drove
+    the wrote-no-docs follow-up loop.
+    """
     set_active_page(page)
-    _METHODOLOGY_TRACES_BY_THREAD[threading.get_ident()] = {
+    existing = _METHODOLOGY_TRACES_BY_RUN.get(run_id)
+    if existing is not None:
+        existing["page"] = page
+        existing["expected_skills"] = list(expected_skills or [])
+        _METHODOLOGY_TRACES_BY_THREAD[threading.get_ident()] = existing
+        return
+    trace = {
         "run_id": run_id,
         "project_id": project_id,
         "page": page,
@@ -665,6 +685,8 @@ def start_methodology_trace(
         "tool_failure_counts": {},
         "episode_write_attempts": [],
     }
+    _METHODOLOGY_TRACES_BY_RUN[run_id] = trace
+    _METHODOLOGY_TRACES_BY_THREAD[threading.get_ident()] = trace
 
 
 def set_methodology_trace_field(key: str, value) -> None:
@@ -676,7 +698,12 @@ def set_methodology_trace_field(key: str, value) -> None:
 
 def consume_methodology_trace() -> dict:
     """Return and clear the current thread's methodology trace."""
-    return _METHODOLOGY_TRACES_BY_THREAD.pop(threading.get_ident(), {})
+    trace = _METHODOLOGY_TRACES_BY_THREAD.pop(threading.get_ident(), None)
+    if trace is not None:
+        rid = str(trace.get("run_id") or "").strip()
+        if rid:
+            _METHODOLOGY_TRACES_BY_RUN.pop(rid, None)
+    return trace or {}
 
 
 def _active_methodology_trace() -> Optional[dict]:
@@ -688,12 +715,13 @@ def _active_methodology_trace() -> Optional[dict]:
     # thread registered. Fall back to the most recently started trace so
     # collect-mode writes from a worker are still recorded instead of silently
     # dropped (which made the orchestrator think "wrote no docs" and forced
-    # follow-up retries → dead loop + wasted spend).
-    fallback = None
+    # follow-up retries → dead loop + wasted spend). Self-heal: bind this
+    # worker thread to the found trace so later writes in the same worker keep
+    # hitting the same dict object.
     for tid, candidate in reversed(tuple(_METHODOLOGY_TRACES_BY_THREAD.items())):
-        fallback = candidate
-        break
-    return fallback
+        _METHODOLOGY_TRACES_BY_THREAD[threading.get_ident()] = candidate
+        return candidate
+    return None
 
 
 def _append_unique_trace_list(key: str, value) -> None:
