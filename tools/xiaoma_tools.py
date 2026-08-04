@@ -198,6 +198,8 @@ def _projects_root_for(project_id: str):
 _MAX_CARD_CHARS = 5000
 _MAX_CARD_SUMMARY_CHARS = 900
 _WRITE_POLICIES_BY_THREAD: dict[int, dict] = {}
+# project_id → policy: worker-thread fallback source (see set_project_write_policy).
+_WRITE_POLICIES_BY_PROJECT: dict[str, dict] = {}
 _METHODOLOGY_TRACES_BY_THREAD: dict[int, dict] = {}
 # run_id → trace: lets ThreadPoolExecutor worker threads (which have a
 # different ident and never see the main thread's registration) reach the same
@@ -829,12 +831,23 @@ def _record_cards_retrieved(args: dict, cards: list[dict], conflicts: list[dict]
 
 
 def set_project_write_policy(policy: dict | None) -> None:
-    """Set write policy for the current agent execution thread."""
+    """Set write policy for the current agent execution thread.
+
+    Also registers a global project_id → policy map so Hermes worker threads
+    (which run tools in ThreadPoolExecutor with a different ident and never see
+    the main thread's registration) can reach the same policy. Without this a
+    worker writing in collect mode sees an empty policy → falls back to direct
+    write → no pending_workspace_writes → the sidecar apply layer rejects the
+    round as partial/write_partial and the modification workflow stalls.
+    """
     thread_id = threading.get_ident()
     if policy is None:
         _WRITE_POLICIES_BY_THREAD.pop(thread_id, None)
     else:
         _WRITE_POLICIES_BY_THREAD[thread_id] = policy
+        project_id = str(policy.get("project_id") or "").strip()
+        if project_id:
+            _WRITE_POLICIES_BY_PROJECT[project_id] = policy
 
 
 def clear_project_write_policy() -> None:
@@ -842,7 +855,19 @@ def clear_project_write_policy() -> None:
 
 
 def active_project_write_policy() -> Optional[dict]:
-    return _WRITE_POLICIES_BY_THREAD.get(threading.get_ident())
+    policy = _WRITE_POLICIES_BY_THREAD.get(threading.get_ident())
+    if policy is not None:
+        return policy
+    # Hermes runs concurrent tool calls in ThreadPoolExecutor workers; those
+    # worker threads have a different ident and never see the policy the main
+    # thread registered. Fall back to the most recently set policy so
+    # collect-mode writes from a worker still honor write_mode/allow scope.
+    # Self-heal: bind this worker thread to the found policy so later writes
+    # in the same worker keep hitting the same dict object.
+    for _tid, candidate in reversed(tuple(_WRITE_POLICIES_BY_THREAD.items())):
+        _WRITE_POLICIES_BY_THREAD[threading.get_ident()] = candidate
+        return candidate
+    return None
 
 
 def _active_workspace_snapshot_cache() -> dict:
@@ -1718,18 +1743,32 @@ def write_project_doc(args: dict, **kw) -> str:
             _episode_seen_keys = seen_keys
             _episode_key = episode_key
 
-        from packages.quality.candidate_gate import evaluate_episode_candidate, may_promote
+        from packages.quality.candidate_gate import evaluate_script_candidate_per_episode, may_promote
 
         _trace_skills = list((trace or {}).get("skills_loaded") or [])
-        _quality = evaluate_episode_candidate(
+        # run_agent_task always compiles and injects the QualityPack for execute
+        # turns (compile_quality_pack writing_guidance + _preload_required_skills).
+        # The per-thread trace marker can fail to reach a Hermes worker under
+        # follow-up reuse, so an active execute-turn write policy is authoritative:
+        # the pack WAS injected and quality_pack_not_loaded must not false-block
+        # an otherwise valid candidate (modification-workflow script repairs).
+        _quality_pack_loaded = bool(
+            (trace or {}).get("quality_pack_loaded")
+            or _trace_skills
+            or str(policy.get("action_intent") or "").strip()
+        )
+        _quality = evaluate_script_candidate_per_episode(
             content,
             path=normalized_path_for_gate,
-            quality_pack_loaded=bool((trace or {}).get("quality_pack_loaded") or _trace_skills),
+            quality_pack_loaded=_quality_pack_loaded,
             skills_loaded=_trace_skills,
         )
         # All episode intents use the same candidate gate. A first draft is
         # not a special delivery state: an unqualified candidate cannot enter
         # the formal artifact pipeline and must follow the bounded retry path.
+        # Batch candidates (e.g. episodes 1-5 in one write) are scored per
+        # episode so a valid multi-episode payload is not rejected for simply
+        # containing N scenes / N×600 chars (same contract as the apply side).
         _accepted = may_promote(_quality)
         _episode_attempt_payload = {
             "path": normalized_path_for_gate,
@@ -1743,8 +1782,13 @@ def write_project_doc(args: dict, **kw) -> str:
             for issue in _quality.blocking_issues:
                 _append_unique_trace_list(
                     "warnings",
-                    f"episode_quality_rejected:{issue.code}:{normalized_path_for_gate}:{issue.message}",
+                    f"episode_quality_rejected:{issue.code}:{issue.path or normalized_path_for_gate}:{issue.message}",
                 )
+
+            def _episode_tag(issue: Any) -> str:
+                label = issue.path.rsplit("#", 1)[-1] if getattr(issue, "path", "") and "#" in str(issue.path) else ""
+                return f"{label} " if label else ""
+
             _reject_msg = "候选正文未通过当前修订质量要求，已保留供返修，不得晋升正式正文。"
             _length_issue = next(
                 (
@@ -1756,7 +1800,7 @@ def write_project_doc(args: dict, **kw) -> str:
             )
             if _length_issue is not None:
                 _reject_msg = (
-                    f"候选正文未通过字数 Gate：{_length_issue.message}"
+                    f"候选正文未通过字数 Gate：{_episode_tag(_length_issue)}{_length_issue.message}"
                     " 请压缩或补足后重新写入；本路径尚未交付。"
                 )
             _rej_stop = not _is_multi_episode_batch_policy(policy)
