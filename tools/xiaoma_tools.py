@@ -1778,6 +1778,21 @@ def write_project_doc(args: dict, **kw) -> str:
             "accepted": _accepted,
             "quality": _quality.to_dict(),
         }
+        # 修改工作流（fix_problems）不设写盘质量硬门：候选直接落盘，未过项记
+        # advisory warnings 供复查/报告，避免「写不出→重试→stop-loss」死循环。
+        # 初稿/SSS（preset/workflow2_execute）仍走既有硬门，防止垃圾正文入库。
+        # 结构门（_validate_script_candidate：必须含第N集标题、范围正确）保持 fail-closed。
+        _repair_soft_gate = (
+            str(policy.get("action_intent") or "").strip() == "fix_problems"
+        )
+        if not _accepted and _repair_soft_gate:
+            for issue in _quality.blocking_issues:
+                _append_unique_trace_list(
+                    "warnings",
+                    f"episode_quality_advisory:{issue.code}:{issue.path or normalized_path_for_gate}:{issue.message}",
+                )
+            _accepted = True
+            _episode_attempt_payload["accepted"] = True
         if not _accepted:
             for issue in _quality.blocking_issues:
                 _append_unique_trace_list(
