@@ -2088,15 +2088,10 @@ class AIAgent:
             _agent_section = {}
         self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
-        # App-level API retry count (wraps each model API call).  Default 3,
-        # overridable via agent.api_max_retries in config.yaml.  See #11616.
-        try:
-            _raw_api_retries = _agent_section.get("api_max_retries", 3)
-            _api_retries = int(_raw_api_retries)
-            _api_retries = max(_api_retries, 1)  # 1 = no retry (single attempt)
-        except (TypeError, ValueError):
-            _api_retries = 3
-        self._api_max_retries = _api_retries
+        # Transport failover belongs to the application model gateway. Hermes
+        # must make one provider request and return the structured result; a
+        # second attempt here would duplicate the gateway route contract.
+        self._api_max_retries = 1
 
         # Initialize context compressor for automatic context management
         # Compresses conversation when approaching model's context limit
@@ -6962,7 +6957,7 @@ class AIAgent:
         import httpx as _httpx
 
         active_client = client or self._ensure_primary_openai_client(reason="codex_stream_direct")
-        max_stream_retries = 1
+        max_stream_retries = 0
         has_tool_calls = False
         first_delta_fired = False
         # Accumulate streamed text so we can recover if get_final_response()
@@ -8309,7 +8304,9 @@ class AIAgent:
         def _call():
             import httpx as _httpx
 
-            _max_stream_retries = int(os.getenv("HERMES_STREAM_RETRIES", 2))
+            # The gateway owns the ordered route pass. Do not reopen the same
+            # upstream stream from inside Hermes after a transport failure.
+            _max_stream_retries = 0
 
             try:
                 for _stream_attempt in range(_max_stream_retries + 1):
