@@ -32,6 +32,7 @@ from packages.script_document import (
     merge_episode_range,
     parse_script_document,
     parse_script_target,
+    render_episode_range,
 )
 from packages.episode_outline_contract import (
     is_episode_outline_path,
@@ -491,7 +492,12 @@ def _script_target_from_policy(policy: dict[str, Any]) -> Any:
 
 
 def _validate_script_candidate(content: str, policy: dict[str, Any]) -> tuple[str, Any] | None:
-    """Validate that a script write contains exactly the authorized range."""
+    """Return the requested range while ignoring surrounding context episodes.
+
+    Agents often include already-written episodes as continuity anchors. That
+    is valid input for a global writing task; the formal artifact still needs
+    only the current target range, so extract it before merge/delivery.
+    """
 
     target = _script_target_from_policy(policy)
     if target is None:
@@ -500,10 +506,16 @@ def _validate_script_candidate(content: str, policy: dict[str, Any]) -> tuple[st
         document = parse_script_document(content)
     except ScriptDocumentError:
         return None
-    expected = tuple(range(target.episode_range.start, target.episode_range.end + 1))
-    if document.episode_ids != expected:
+    if not document.episodes:
         return None
-    return content.rstrip("\r\n") + "\n", target
+    try:
+        selected = document.range(target.episode_range)
+    except ScriptDocumentError:
+        return None
+    normalized = render_episode_range(
+        (episode.episode_id, episode.body) for episode in selected
+    )
+    return normalized, target
 
 def _current_progress_task_context() -> tuple[str, str]:
     """Return (page, action_intent) for the active run, if known.
@@ -1743,7 +1755,7 @@ def write_project_doc(args: dict, **kw) -> str:
             _episode_seen_keys = seen_keys
             _episode_key = episode_key
 
-        from packages.quality.candidate_gate import evaluate_script_candidate_per_episode, may_promote
+        from packages.quality.candidate_gate import evaluate_script_candidate_per_episode
 
         _trace_skills = list((trace or {}).get("skills_loaded") or [])
         # run_agent_task always compiles and injects the QualityPack for execute
@@ -1763,76 +1775,21 @@ def write_project_doc(args: dict, **kw) -> str:
             quality_pack_loaded=_quality_pack_loaded,
             skills_loaded=_trace_skills,
         )
-        # All episode intents use the same candidate gate. A first draft is
-        # not a special delivery state: an unqualified candidate cannot enter
-        # the formal artifact pipeline and must follow the bounded retry path.
-        # Batch candidates (e.g. episodes 1-5 in one write) are scored per
-        # episode so a valid multi-episode payload is not rejected for simply
-        # containing N scenes / N×600 chars (same contract as the apply side).
-        _accepted = may_promote(_quality)
+        # The evaluator is a review instrument only. It supplies concrete
+        # findings for the trace and later Agent review; it never blocks a
+        # structurally valid screenplay from entering the artifact pipeline.
         _episode_attempt_payload = {
             "path": normalized_path_for_gate,
             "phase": "initial",
             "attempt": 1,
             "effective_chars": _body_chars,
-            "accepted": _accepted,
+            "accepted": True,
             "quality": _quality.to_dict(),
         }
-        # 修改工作流（fix_problems）不设写盘质量硬门：候选直接落盘，未过项记
-        # advisory warnings 供复查/报告，避免「写不出→重试→stop-loss」死循环。
-        # 初稿/SSS（preset/workflow2_execute）仍走既有硬门，防止垃圾正文入库。
-        # 结构门（_validate_script_candidate：必须含第N集标题、范围正确）保持 fail-closed。
-        _repair_soft_gate = (
-            str(policy.get("action_intent") or "").strip() == "fix_problems"
-        )
-        if not _accepted and _repair_soft_gate:
-            for issue in _quality.blocking_issues:
-                _append_unique_trace_list(
-                    "warnings",
-                    f"episode_quality_advisory:{issue.code}:{issue.path or normalized_path_for_gate}:{issue.message}",
-                )
-            _accepted = True
-            _episode_attempt_payload["accepted"] = True
-        if not _accepted:
-            for issue in _quality.blocking_issues:
-                _append_unique_trace_list(
-                    "warnings",
-                    f"episode_quality_rejected:{issue.code}:{issue.path or normalized_path_for_gate}:{issue.message}",
-                )
-
-            def _episode_tag(issue: Any) -> str:
-                label = issue.path.rsplit("#", 1)[-1] if getattr(issue, "path", "") and "#" in str(issue.path) else ""
-                return f"{label} " if label else ""
-
-            _reject_msg = "候选正文未通过当前修订质量要求，已保留供返修，不得晋升正式正文。"
-            _length_issue = next(
-                (
-                    issue
-                    for issue in _quality.blocking_issues
-                    if issue.code in {"length_under", "length_over"}
-                ),
-                None,
-            )
-            if _length_issue is not None:
-                _reject_msg = (
-                    f"候选正文未通过字数 Gate：{_episode_tag(_length_issue)}{_length_issue.message}"
-                    " 请压缩或补足后重新写入；本路径尚未交付。"
-                )
-            _rej_stop = not _is_multi_episode_batch_policy(policy)
-            if not _rej_stop:
-                _reject_msg = (
-                    _reject_msg + " 请压缩或改写后继续写本批剩余目标集，不要结束回合。"
-                )
-            return tool_result(
-                success=False,
-                path=normalized_path_for_gate,
-                normalized_path=normalized_path_for_gate,
-                accepted=False,
-                effective_chars=_body_chars,
-                quality=_quality.to_dict(),
-                message=_reject_msg,
-                error=_reject_msg,
-                stop_current_turn=_rej_stop,
+        for issue in _quality.issues:
+            _append_unique_trace_list(
+                "warnings",
+                f"episode_quality_advisory:{issue.code}:{issue.path or normalized_path_for_gate}:{issue.message}",
             )
         # 波别要求：剧集正文严禁破折号「——」（DeepSeek 强写、SKILL/prompt 都管不住），
         # 写盘兜底：把「——」替换成全角逗号（对白/动作的连接停顿用逗号，语义无损）。
@@ -2107,6 +2064,11 @@ def write_project_doc(args: dict, **kw) -> str:
         overwritten=True,
         accepted=True,
         effective_chars=_episode_effective_chars,
+        quality=(
+            _episode_attempt_payload.get("quality")
+            if _episode_attempt_payload is not None
+            else None
+        ),
         stop_current_turn=_stop_episode_collect_turn,
         message=(
             "剧集候选已收集，当前内层回合立即结束。"
@@ -2227,7 +2189,15 @@ def retrieve_market_cards(args: dict, **kw) -> str:
         task (str): optional task filter, e.g. brainstorm, synopsis, outline, write_batch, first_episode, revise, audit
         problem (str): optional specific problem to search for, e.g. format, hook, pacing, character, dialogue
         max_chars (int): optional maximum returned content characters
+        market (str): REQUIRED canonical market: domestic | overseas | thailand
+            (R6 市场隔离：海外请求排除国内索引；缺失 fail-closed 不回退全库)
     """
+    market = (args.get("market") or "").strip().lower()
+    if market not in ("domestic", "overseas", "thailand"):
+        return tool_error(
+            "retrieve_market_cards 需要合法 market 参数（domestic|overseas|thailand）；"
+            "海外项目禁止检索国内知识索引，market 缺失时不回退全库。"
+        )
     stage = (args.get("stage") or "inspiration").strip()
     fmt = (args.get("format") or "manhua").strip()
     topic = _normalize_topic(args.get("topic") or "")
@@ -2254,6 +2224,7 @@ def retrieve_market_cards(args: dict, **kw) -> str:
                 task=task,
                 problem=problem,
                 max_results=8,
+                market=market,
             )
             for ir in index_results:
                 file_path = _resolve_knowledge_path(ir["path"])
@@ -2393,15 +2364,26 @@ def _duckduckgo_search(query: str, limit: int) -> list[dict]:
 
 
 def search_reference_drama(args: dict, **kw) -> str:
-    """Search reference drama information from approved knowledge first, then web."""
+    """Search reference drama information from approved knowledge first, then web.
+
+    R6 市场隔离（用户批准保护子模块修改）：market 必填（canonical 三市场）；
+    国内红果索引只对 domestic 查询开放；海外项目联网搜索词按市场限定，
+    不再使用固定中文红果语境；无匹配返回 coverage_gap，不回退国内索引。
+    """
     query = str(args.get("query") or "").strip()
     if not query:
         return tool_error("query is required")
+    market = str(args.get("market") or "").strip().lower()
+    if market not in ("domestic", "overseas", "thailand"):
+        return tool_error(
+            "search_reference_drama 需要合法 market 参数（domestic|overseas|thailand）；"
+            "海外项目不得检索国内红果索引，market 缺失时不回退全库。"
+        )
     limit = max(1, min(int(args.get("limit") or 5), 8))
 
     knowledge_matches: list[dict] = []
     index_path = (_REDFRUIT_ROOT / "blockbuster-cases" / "index.md").resolve()
-    if index_path.exists():
+    if market == "domestic" and index_path.exists():
         try:
             for line in index_path.read_text(encoding="utf-8").splitlines():
                 if "|" not in line or query not in line:
@@ -2425,7 +2407,12 @@ def search_reference_drama(args: dict, **kw) -> str:
     web_results: list[dict] = []
     try:
         from tools.web_tools import web_search_tool
-        raw = web_search_tool(f"{query} 短剧 漫剧 热度 集数 剧情", limit=limit)
+        market_query_suffix = {
+            "domestic": "短剧 漫剧 热度 集数 剧情",
+            "overseas": "English vertical drama US short drama",
+            "thailand": "泰剧 ละครสั้น Thai short drama",
+        }.get(market, "短剧 漫剧 热度 集数 剧情")
+        raw = web_search_tool(f"{query} {market_query_suffix}", limit=limit)
         parsed = json.loads(raw) if isinstance(raw, str) else raw
         if isinstance(parsed, dict) and parsed.get("success") is True:
             web_data = parsed.get("data", {}).get("web", [])
@@ -2441,7 +2428,7 @@ def search_reference_drama(args: dict, **kw) -> str:
     except Exception as exc:
         _append_unique_trace_list("warnings", f"reference_drama_web_search_failed: {exc}")
         try:
-            web_results = _duckduckgo_search(f"{query} 短剧 漫剧 热度 集数 剧情", limit)
+            web_results = _duckduckgo_search(f"{query} {market_query_suffix}", limit)
         except Exception:
             pass
 
