@@ -2561,6 +2561,19 @@ registry.register(
     description="List project ledger files",
 )
 
+# R4-schema（Review 返工四）：canonical market 工具参数唯一合同。
+# 所有注册入口读取同一份定义——handler 已在 R6 强制 fail-closed，
+# schema 同步要求模型必须传入 market，禁止国内知识流入海外请求。
+_MARKET_TOOL_PARAM = {
+    "type": "string",
+    "enum": ["domestic", "overseas", "thailand"],
+    "description": (
+        "REQUIRED canonical market. domestic=国内, overseas=欧美(北美), thailand=泰国. "
+        "海外请求排除国内知识索引；缺失或非法值 fail-closed 不回退全库。"
+    ),
+}
+
+
 registry.register(
     name="retrieve_market_cards",
     toolset="xiaoma_project",
@@ -2598,8 +2611,9 @@ registry.register(
                     "type": "integer",
                     "description": "Maximum returned content characters, capped by the tool",
                 },
+                "market": dict(_MARKET_TOOL_PARAM),
             },
-            "required": ["stage"],
+            "required": ["stage", "market"],
         },
     },
     handler=retrieve_market_cards,
@@ -2617,8 +2631,9 @@ registry.register(
             "properties": {
                 "query": {"type": "string", "description": "Drama title or keywords"},
                 "limit": {"type": "integer", "description": "Maximum results, 1-8"},
+                "market": dict(_MARKET_TOOL_PARAM),
             },
-            "required": ["query"],
+            "required": ["query", "market"],
         },
     },
     handler=search_reference_drama,
