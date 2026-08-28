@@ -824,6 +824,7 @@ def _record_cards_retrieved(args: dict, cards: list[dict], conflicts: list[dict]
     for card in cards:
         item = {
             "id": card.get("id"),
+            "title": card.get("title"),
             "path": card.get("path"),
             "priority": card.get("priority"),
             "score": card.get("score"),
@@ -2235,6 +2236,7 @@ def retrieve_market_cards(args: dict, **kw) -> str:
                         cards.append({
                             "path": ir["path"],
                             "id": ir["id"],
+                            "title": ir.get("title", ""),
                             "layer": ir["layer"],
                             "priority": ir["priority"],
                             "priority_order": ir.get("priority_order"),
