@@ -41,7 +41,7 @@ from packages.episode_outline_contract import (
 from packages.episode_revision_contract import (
     validate_pending_episode_revision_paths,
 )
-from xiaoma.orchestrator_episode_batches import pending_write_key
+from xiaoma.orchestrator_episode_batches import keep_existing_pending_payload, pending_write_key
 
 
 def _ensure_runtime_root_on_syspath() -> None:
@@ -160,18 +160,24 @@ else:
 
 
 def _projects_root_for(project_id: str):
-    """Return the projects root that actually contains this project_id."""
+    """Return the projects root that actually contains this project_id.
+
+    P2 身份返工：候选顺序改为“当前环境变量优先，模块 import 时捕获值殿后”。
+    旧顺序把 import 时的 _PROJECTS_ROOT 放第一——同一进程内 env 切换后
+    （测试夹具轮换工作区）仍命中旧根，导致冻结与落盘看到不同项目树。
+    生产进程 env 全程稳定，新旧顺序结论一致；写路径与冻结共用本函数，
+    两者 parity 恒成立。
+    """
     pid = str(project_id or "").strip()
     candidates = []
-    for root in (_PROJECTS_ROOT,):
-        try:
-            candidates.append(Path(root))
-        except Exception:
-            pass
     for env_name in ("XIAOMA_PROJECTS_ROOT", "XIAOMA_WORKSPACE_ROOT", "LOCAL_WORKSPACE_PATH"):
         raw = os.environ.get(env_name, "").strip()
         if raw:
             candidates.append(Path(raw))
+    try:
+        candidates.append(Path(_PROJECTS_ROOT))
+    except Exception:
+        pass
     try:
         candidates.append(Path(_WORKSPACE_ROOT))
     except Exception:
@@ -199,8 +205,11 @@ def _projects_root_for(project_id: str):
 _MAX_CARD_CHARS = 5000
 _MAX_CARD_SUMMARY_CHARS = 900
 _WRITE_POLICIES_BY_THREAD: dict[int, dict] = {}
-# project_id → policy: worker-thread fallback source (see set_project_write_policy).
-_WRITE_POLICIES_BY_PROJECT: dict[str, dict] = {}
+# run_id → policy: worker 线程按本轮 run 显式取得冻结上下文的唯一通道
+#（P2 权威身份返工）。键精确匹配，不做"最近一个"兜底。
+# 注：旧 _WRITE_POLICIES_BY_PROJECT（project_id→policy）已删除——全仓只写
+# 不读，其注释自称的 worker 回退职责从未实现，保留即是误导。
+_WRITE_POLICIES_BY_RUN: dict[str, dict] = {}
 _METHODOLOGY_TRACES_BY_THREAD: dict[int, dict] = {}
 # run_id → trace: lets ThreadPoolExecutor worker threads (which have a
 # different ident and never see the main thread's registration) reach the same
@@ -523,7 +532,7 @@ def _current_progress_task_context() -> tuple[str, str]:
     Write policy is the authoritative task context (set before agent runs).
     Fall back to thread-local active page when policy is absent.
     """
-    policy = active_project_write_policy() or {}
+    policy = active_project_write_policy(run_id=_policy_run_id_from_trace()) or {}
     page = str(policy.get("page") or active_page() or "").strip()
     action_intent = str(policy.get("action_intent") or "").strip()
     return page, action_intent
@@ -539,7 +548,7 @@ def _describe_doc_path(path: str) -> str:
     if not p:
         return ""
     if p == SCRIPT_PATH:
-        target = _script_target_from_policy(active_project_write_policy() or {})
+        target = _script_target_from_policy(active_project_write_policy(run_id=_policy_run_id_from_trace()) or {})
         if target is not None:
             return target.episode_range.label()
         return "整部剧稿"
@@ -771,7 +780,7 @@ def _tool_failure(tool_name: str, project_id: str, message: str) -> str:
     counts = trace.setdefault("tool_failure_counts", {})
     count = int(counts.get(tool_name, 0) or 0) + 1
     counts[tool_name] = count
-    policy = active_project_write_policy() or {}
+    policy = active_project_write_policy(run_id=_policy_run_id_from_trace()) or {}
     if (
         tool_name == "write_project_doc"
         and str(policy.get("page") or "") == "episodes"
@@ -843,48 +852,77 @@ def _record_cards_retrieved(args: dict, cards: list[dict], conflicts: list[dict]
         _append_unique_trace_list("rules_conflicts", conflict)
 
 
-def set_project_write_policy(policy: dict | None) -> None:
+def set_project_write_policy(policy: dict | None, *, run_id: str = "") -> None:
     """Set write policy for the current agent execution thread.
 
-    Also registers a global project_id → policy map so Hermes worker threads
-    (which run tools in ThreadPoolExecutor with a different ident and never see
-    the main thread's registration) can reach the same policy. Without this a
-    worker writing in collect mode sees an empty policy → falls back to direct
-    write → no pending_workspace_writes → the sidecar apply layer rejects the
-    round as partial/write_partial and the modification workflow stalls.
+    P2 权威身份返工：策略同时按 run_id 登记（_WRITE_POLICIES_BY_RUN），
+    worker 线程凭本轮 run_id 显式取得同一份冻结上下文，不再靠"最近一个"
+    猜。run_id 与 policy["run_id"] 不一致时以显式参数为准（调用方必须传
+    本轮真实 run）。
     """
     thread_id = threading.get_ident()
     if policy is None:
         _WRITE_POLICIES_BY_THREAD.pop(thread_id, None)
-    else:
-        _WRITE_POLICIES_BY_THREAD[thread_id] = policy
-        project_id = str(policy.get("project_id") or "").strip()
-        if project_id:
-            _WRITE_POLICIES_BY_PROJECT[project_id] = policy
+        if run_id:
+            _WRITE_POLICIES_BY_RUN.pop(str(run_id), None)
+        return
+    normalized_run_id = str(run_id or policy.get("run_id") or "").strip()
+    if normalized_run_id:
+        policy["run_id"] = normalized_run_id
+        _WRITE_POLICIES_BY_RUN[normalized_run_id] = policy
+    _WRITE_POLICIES_BY_THREAD[thread_id] = policy
 
 
-def clear_project_write_policy() -> None:
+def clear_project_write_policy(*, run_id: str = "") -> None:
+    """清理本轮写策略：当前线程＋该 run 在各线程的残留绑定一并清除。
+
+    P2 权威身份返工：worker 线程一旦绑定过期策略会一直沿用（旧自愈逻辑），
+    因此按 run_id 横扫所有线程绑定，不只清当前线程。请求结束、异常和取消
+    路径都必须带 run_id 调用（orchestrator finally 保证）。
+    """
     _WRITE_POLICIES_BY_THREAD.pop(threading.get_ident(), None)
+    normalized_run_id = str(run_id or "").strip()
+    if not normalized_run_id:
+        return
+    _WRITE_POLICIES_BY_RUN.pop(normalized_run_id, None)
+    for thread_id, bound in list(_WRITE_POLICIES_BY_THREAD.items()):
+        if isinstance(bound, dict) and str(bound.get("run_id") or "").strip() == normalized_run_id:
+            _WRITE_POLICIES_BY_THREAD.pop(thread_id, None)
 
 
-def active_project_write_policy() -> Optional[dict]:
-    policy = _WRITE_POLICIES_BY_THREAD.get(threading.get_ident())
-    if policy is not None:
-        return policy
-    # Hermes runs concurrent tool calls in ThreadPoolExecutor workers; those
-    # worker threads have a different ident and never see the policy the main
-    # thread registered. Fall back to the most recently set policy so
-    # collect-mode writes from a worker still honor write_mode/allow scope.
-    # Self-heal: bind this worker thread to the found policy so later writes
-    # in the same worker keep hitting the same dict object.
-    for _tid, candidate in reversed(tuple(_WRITE_POLICIES_BY_THREAD.items())):
-        _WRITE_POLICIES_BY_THREAD[threading.get_ident()] = candidate
-        return candidate
-    return None
+def _policy_run_id_from_trace() -> str:
+    """本轮 run 亲和：从方法论 trace 取 run_id，供策略按 run 精确取得。
+
+    trace 仍沿用既有 _active_methodology_trace 通道（含 worker 可达性）；
+    策略侧只做精确键匹配，不再叠加第二套"最近"兜底——两层各用一套
+    "最近"且可能指向不同 run，正是跨项目串线的结构成因。
+    """
+    trace = _active_methodology_trace()
+    if isinstance(trace, dict):
+        return str(trace.get("run_id") or "").strip()
+    return ""
+
+
+def active_project_write_policy(*, run_id: str = "") -> Optional[dict]:
+    """取本轮写策略：只认精确绑定，不认"最近一个"。
+
+    P2 权威身份返工：删除"最近注册策略"兜底（该兜底不校验归属，
+    还会自愈永久粘住 worker 线程）。解析顺序：
+    1. 显式 run_id（非空）→ _WRITE_POLICIES_BY_RUN 精确命中即返回；
+    2. 当前线程精确绑定（同线程直调与直设策略兼容）。
+    两者皆无即 None（调用方 fail-closed），绝不返回别的 run 的策略，
+    也绝不把"最近 set 的任意策略"当成当前策略。
+    """
+    normalized_run_id = str(run_id or "").strip()
+    if normalized_run_id:
+        bound = _WRITE_POLICIES_BY_RUN.get(normalized_run_id)
+        if bound is not None:
+            return bound
+    return _WRITE_POLICIES_BY_THREAD.get(threading.get_ident())
 
 
 def _active_workspace_snapshot_cache() -> dict:
-    policy = active_project_write_policy() or {}
+    policy = active_project_write_policy(run_id=_policy_run_id_from_trace()) or {}
     cache = policy.get("workspace_snapshot_cache")
     return cache if isinstance(cache, dict) else {}
 
@@ -920,7 +958,7 @@ def _project_doc_read_satisfies(required_path: str, read_docs: list[str] | tuple
 
 def _is_multi_episode_batch_policy(policy: Optional[dict] = None) -> bool:
     """True when multi-episode batch must continue after one write fail/success."""
-    pol = policy if isinstance(policy, dict) else (active_project_write_policy() or {})
+    pol = policy if isinstance(policy, dict) else (active_project_write_policy(run_id=_policy_run_id_from_trace()) or {})
     action = str(pol.get("action_intent") or "").strip()
     if action == "workflow2_execute":
         return True
@@ -939,7 +977,7 @@ def _is_multi_episode_batch_policy(policy: Optional[dict] = None) -> bool:
 
 
 def _path_allowed_by_policy(project_id: str, path: str) -> Optional[str]:
-    policy = active_project_write_policy()
+    policy = active_project_write_policy(run_id=_policy_run_id_from_trace())
     if not policy or policy.get("project_id") != project_id:
         return None
     if policy.get("mode") == "deny":
@@ -1428,7 +1466,7 @@ def read_project_doc(args: dict, **kw) -> str:
 
     if not target.exists():
         _emit_progress("read", path, phase="failed")
-        return _tool_failure("read_project_doc", project_id, f"File not found: data/projects/{project_id}/{path}")
+        return _tool_failure("read_project_doc", project_id, f"File not found: {path}")
 
     if not target.is_file():
         # Directory reached file resolver — hand off to list for better recovery.
@@ -1449,7 +1487,7 @@ def read_project_doc(args: dict, **kw) -> str:
         return _tool_failure(
             "read_project_doc",
             project_id,
-            f"Cannot read binary file: data/projects/{project_id}/{path}"
+            f"Cannot read binary file: {path}"
         )
     except Exception as exc:
         _emit_progress("read", path, phase="failed")
@@ -1597,7 +1635,7 @@ def list_project_docs(args: dict, **kw) -> str:
 
     if not target.is_dir():
         _emit_progress("list", path or ".", phase="failed")
-        return tool_error(f"Not a directory: data/projects/{project_id}/{path}")
+        return tool_error(f"Not a directory: {path}")
 
     project_root = (_PROJECTS_ROOT / project_id).resolve()
     files = sorted(
@@ -1651,13 +1689,50 @@ def write_project_doc(args: dict, **kw) -> str:
     """Write content to a project document file (overwrites, creates dirs).
 
     Schema:
-        project_id (str): Project identifier
         path (str):      File path relative to the project directory
         content (str):   File content to write
+
+    project_id 不再是模型参数：服务端按本轮冻结身份执行；若仍传入，
+    与冻结不一致即拒绝，一致则忽略（见下方身份门）。
     """
-    project_id = args.get("project_id", "")
     path = args.get("path", "")
     content = args.get("content", "")
+
+    # P2 权威身份返工：身份只读冻结上下文，不读模型参数、不读进程最近值。
+    # - 策略缺失（无本线程绑定、无本轮 run 登记）→ 整轮停止，不退回模型值，
+    #   不计 stop-loss 预算（tool_error，非 _tool_failure）；
+    # - 冻结身份 = policy["frozen_project_id"]（入口冻结盖章）；兼容直设策略
+    #   时退到 policy["project_id"]（调用方自保证，仅测试与非模型直调）；
+    # - 模型若仍传 project_id：与冻结不一致即拒绝（零副作用；篡改信号计入
+    #   stop-loss，与旧轮行为一致）；一致或缺席都不改变身份（缺席是提示词
+    #   整改后的正常形态）。
+    # 拒绝分支早于 manifest/pending/磁盘三者，后续逻辑不可达。
+    frozen_policy = active_project_write_policy(run_id=_policy_run_id_from_trace())
+    if frozen_policy is None:
+        return tool_error(
+            "本轮缺少已冻结的项目身份，已停止写入（未写入任何内容）。"
+            "请从当前项目重新发起该步骤。",
+            stop_current_turn=True,
+        )
+    frozen_project_id = str(
+        frozen_policy.get("frozen_project_id") or frozen_policy.get("project_id") or ""
+    ).strip()
+    if not frozen_project_id:
+        return tool_error(
+            "本轮冻结的项目身份为空，已停止写入（未写入任何内容）。"
+            "请从当前项目重新发起该步骤。",
+            stop_current_turn=True,
+        )
+    model_project_id = str(args.get("project_id", "") or "").strip()
+    if model_project_id and model_project_id != frozen_project_id:
+        return _tool_failure(
+            "write_project_doc",
+            frozen_project_id,
+            "项目身份不一致：本轮归属项目 "
+            f"{frozen_project_id}，但写入参数为 {model_project_id}，"
+            "已拒绝（未写入任何内容）。请从当前项目重新发起该步骤。",
+        )
+    project_id = frozen_project_id
 
     # Episode duplicate-guard state, initialized at function scope so the
     # canonicalize-time check (after the SCRIPT_PATH block) can safely read it
@@ -1692,7 +1767,7 @@ def write_project_doc(args: dict, **kw) -> str:
     # rejected only because the model chose the display name.
     original_path = path
     path = _canonical_project_doc_path(path).replace("\\", "/").strip().lstrip("./")
-    policy = active_project_write_policy() or {}
+    policy = active_project_write_policy(run_id=_policy_run_id_from_trace()) or {}
     if path.startswith("episodes/") and path != SCRIPT_PATH:
         return _tool_failure(
             "write_project_doc",
@@ -1987,6 +2062,15 @@ def write_project_doc(args: dict, **kw) -> str:
             )
             if existing is None:
                 pending.append(payload)
+            elif keep_existing_pending_payload(existing, payload):
+                # W-sss-all-episodes-verifier-reject (a)：同 key 已有更完整候选时，
+                # 极简存根不得覆盖；工具结果语义不变，只记机器诊断账供重试对账。
+                trace.setdefault("episode_write_notes", []).append({
+                    "kept": "existing",
+                    "key": payload_key,
+                    "existing_chars": len(str(existing.get("content") or "")),
+                    "incoming_chars": len(str(payload.get("content") or "")),
+                })
             else:
                 existing.update(payload)
             if _episode_attempt_payload is not None:
@@ -2514,14 +2598,15 @@ registry.register(
     toolset="xiaoma_project",
     schema={
         "name": "write_project_doc",
-        "description": "Write content to a project document file (creates directories if needed, overwrites existing file)",
+        "description": (
+            "Write content to a project document file (creates directories if needed, "
+            "overwrites existing file). "
+            "The project is bound server-side to the current run: do NOT pass project_id "
+            "(it is ignored); only pass the business-relative path and content."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "project_id": {
-                    "type": "string",
-                    "description": "Project identifier (e.g. 'proj_abc123')",
-                },
                 "path": {
                     "type": "string",
                     "description": "File path relative to the project directory (e.g. 'synopsis.md')",
@@ -2535,7 +2620,7 @@ registry.register(
                     "description": "Optional structured prewrite contract for the requested logical episode range in episodes/script.md. Must include scene_plan, opening_conflict, protagonist_goal, ending_hook, target_chars_min, target_chars_max, os_budget.",
                 },
             },
-            "required": ["project_id", "path", "content"],
+            "required": ["path", "content"],
         },
     },
     handler=write_project_doc,
