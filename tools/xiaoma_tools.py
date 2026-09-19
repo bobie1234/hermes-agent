@@ -500,27 +500,27 @@ def _script_target_from_policy(policy: dict[str, Any]) -> Any:
         return None
 
 
-def _validate_script_candidate(content: str, policy: dict[str, Any]) -> tuple[str, Any] | None:
-    """Return the requested range while ignoring surrounding context episodes.
+def _validate_script_candidate(content: str, policy: dict[str, Any]) -> tuple[str, Any] | tuple[None, str]:
+    """Return (normalized, target), or (None, reason_code) with a stable reason.
 
-    Agents often include already-written episodes as continuity anchors. That
-    is valid input for a global writing task; the formal artifact still needs
-    only the current target range, so extract it before merge/delivery.
+    W-script-submit-contract-gap：拒绝原因必须可区分，不能合并返回 None。
+    reason_code 只有四种：no_script_target / parse_failed / empty_episodes /
+    range_mismatch，调用方据此给出不同修复指引。
     """
 
     target = _script_target_from_policy(policy)
     if target is None:
-        return None
+        return None, "no_script_target"
     try:
         document = parse_script_document(content)
     except ScriptDocumentError:
-        return None
+        return None, "parse_failed"
     if not document.episodes:
-        return None
+        return None, "empty_episodes"
     try:
         selected = document.range(target.episode_range)
     except ScriptDocumentError:
-        return None
+        return None, "range_mismatch"
     normalized = render_episode_range(
         (episode.episode_id, episode.body) for episode in selected
     )
@@ -1784,18 +1784,24 @@ def write_project_doc(args: dict, **kw) -> str:
         if not content.strip():
             return _tool_failure("write_project_doc", project_id, "剧集正文为空，无法写入。")
         _validated_script = _validate_script_candidate(content, policy)
-        if _validated_script is None:
+        if _validated_script[0] is None:
+            _validate_reason = _validated_script[1]
             expected_target = _script_target_from_policy(policy)
             range_detail = (
-                f"本轮目标为{expected_target.episode_range.label()}。"
+                expected_target.episode_range.label()
                 if expected_target is not None
-                else "当前写策略缺少有效 script_target。"
+                else "no_script_target"
             )
+            _reason_guidance = {
+                "no_script_target": "当前写入缺少有效 script_target，目标区间未知，请检查写剧任务的目标集范围配置。",
+                "parse_failed": "剧集标题行格式错误：目标区间内每集必须使用独立一行的第N集标题，不要合并多集或改写标题格式。",
+                "empty_episodes": "正文为空或没有可识别的剧集段落，无法提交。",
+                "range_mismatch": "提交区间与系统指定的连续范围不一致，请只提交系统指定的连续范围（目标为" + range_detail + "）。",
+            }
             return _tool_failure(
                 "write_project_doc",
                 project_id,
-                "剧稿候选必须只包含系统指定的连续集范围，并使用独立一行的第N集标题。"
-                + range_detail,
+                _reason_guidance.get(str(_validate_reason), "剧集候选校验未通过（" + range_detail + "）。"),
             )
         content, _episode_target = _validated_script
         normalized_path_for_gate = _normalize_project_doc_trace_path(path)
