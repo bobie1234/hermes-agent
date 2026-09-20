@@ -1184,6 +1184,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        openai_metadata_only_urls: tuple[str, ...] = (),
     ):
         """
         Initialize the AI Agent.
@@ -1193,6 +1194,7 @@ class AIAgent:
             api_key (str): API key for authentication (optional, uses env var if not provided)
             provider (str): Provider identifier (optional; used for telemetry/routing hints)
             api_mode (str): API mode override: "chat_completions" or "codex_responses"
+            openai_metadata_only_urls (tuple): Exact proxy URLs with no native inference metadata APIs.
             model (str): Model name to use (default: "anthropic/claude-opus-4.6")
             max_iterations (int): Maximum number of tool calling iterations (default: 40)
             tool_delay (float): Delay between tool calls in seconds (default: 1.0)
@@ -1244,6 +1246,7 @@ class AIAgent:
         self.save_trajectories = save_trajectories
         self.verbose_logging = verbose_logging
         self.quiet_mode = quiet_mode
+        self._openai_metadata_only_urls = tuple(openai_metadata_only_urls)
         self.ephemeral_system_prompt = ephemeral_system_prompt
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
         self._user_id = user_id  # Platform user identifier (gateway sessions)
@@ -2309,6 +2312,7 @@ class AIAgent:
                 config_context_length=_config_context_length,
                 provider=self.provider,
                 custom_providers=_custom_providers,
+                openai_metadata_only_urls=self._openai_metadata_only_urls,
             )
             self.context_compressor.update_model(
                 model=self.model,
@@ -2333,6 +2337,7 @@ class AIAgent:
                 config_context_length=_config_context_length,
                 provider=self.provider,
                 api_mode=self.api_mode,
+                openai_metadata_only_urls=self._openai_metadata_only_urls,
             )
         self.compression_enabled = compression_enabled
 
@@ -2736,6 +2741,7 @@ class AIAgent:
                 provider=self.provider,
                 config_context_length=getattr(self, "_config_context_length", None),
                 custom_providers=_sm_custom_providers,
+                openai_metadata_only_urls=getattr(self, "_openai_metadata_only_urls", ()),
             )
             self.context_compressor.update_model(
                 model=self.model,
@@ -3246,6 +3252,7 @@ class AIAgent:
                 # are invoked for the correct client, not inherited from the main model.
                 provider=(_aux_cfg_provider if _aux_cfg_provider and _aux_cfg_provider != "auto" else getattr(self, "provider", "")),
                 custom_providers=self._custom_providers,
+                openai_metadata_only_urls=getattr(self, "_openai_metadata_only_urls", ()),
             )
 
             # Hard floor: the auxiliary compression model must have at least
@@ -8937,6 +8944,7 @@ class AIAgent:
                     self.model, base_url=self.base_url,
                     api_key=self.api_key, provider=self.provider,
                     config_context_length=getattr(self, "_config_context_length", None),
+                    openai_metadata_only_urls=getattr(self, "_openai_metadata_only_urls", ()),
                 )
                 self.context_compressor.update_model(
                     model=self.model,

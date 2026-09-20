@@ -640,6 +640,7 @@ def fetch_endpoint_model_metadata(
     base_url: str,
     api_key: str = "",
     force_refresh: bool = False,
+    *, native_server_probes: bool = True,
 ) -> Dict[str, Dict[str, Any]]:
     """Fetch model metadata from an OpenAI-compatible ``/models`` endpoint.
 
@@ -661,13 +662,13 @@ def fetch_endpoint_model_metadata(
         alternate = normalized[:-3].rstrip("/")
     else:
         alternate = normalized + "/v1"
-    if alternate and alternate not in candidates:
+    if native_server_probes and alternate and alternate not in candidates:
         candidates.append(alternate)
 
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     last_error: Optional[Exception] = None
 
-    if is_local_endpoint(normalized):
+    if native_server_probes and is_local_endpoint(normalized):
         try:
             if detect_local_server_type(normalized, api_key=api_key) == "lm-studio":
                 server_url = normalized[:-3].rstrip("/") if normalized.endswith("/v1") else normalized
@@ -749,7 +750,7 @@ def fetch_endpoint_model_metadata(
                 m.get("owned_by") == "llamacpp"
                 for m in payload.get("data", []) if isinstance(m, dict)
             )
-            if is_llamacpp:
+            if native_server_probes and is_llamacpp:
                 try:
                     # Try /v1/props first (current llama.cpp); fall back to /props for older builds
                     base = candidate.rstrip("/").replace("/v1", "")
@@ -1425,6 +1426,7 @@ def get_model_context_length(
     config_context_length: int | None = None,
     provider: str = "",
     custom_providers: list | None = None,
+    openai_metadata_only_urls: tuple[str, ...] = (),
 ) -> int:
     """Get the context length for a model.
 
@@ -1520,6 +1522,21 @@ def get_model_context_length(
                 # Fall through; step 5b reconciles and overwrites if portal responds.
             else:
                 return cached
+
+    # An explicitly declared proxy is not a native inference server. Scope the
+    # capability to its exact URL, including auxiliary/fallback model switches.
+    # Explicit overrides and previously discovered limits retain precedence.
+    if base_url and _normalize_base_url(base_url) in {
+        _normalize_base_url(url) for url in openai_metadata_only_urls
+    }:
+        metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key, native_server_probes=False)
+        entry = metadata.get(model) or {}
+        length = entry.get("context_length")
+        if isinstance(length, int) and not isinstance(length, bool) and length > 0:
+            return length
+        logger.info("Model %r at %s has no declared context length; using default %s (unverified, no native probes)",
+                    model, base_url, DEFAULT_FALLBACK_CONTEXT)
+        return DEFAULT_FALLBACK_CONTEXT
 
     # 1b. AWS Bedrock — use static context length table.
     # Bedrock's ListFoundationModels API doesn't expose context window sizes,
