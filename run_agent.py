@@ -8004,6 +8004,19 @@ class AIAgent:
 
             content_parts: list = []
             tool_calls_acc: dict = {}
+            # Optional application preview; capture per request so a late stream
+            # cannot pick up a later turn's callback. Never execute partial JSON.
+            argument_callback = getattr(self, "tool_argument_callback", None)
+            argument_scope = uuid.uuid4().hex
+
+            def _preview_arguments(index, entry, *, final=False):
+                if argument_callback is not None:
+                    try:
+                        argument_callback(f"{argument_scope}:{index}", entry["function"]["name"],
+                                          entry["function"]["arguments"], final=final)
+                    except Exception:
+                        logger.debug("tool argument preview unavailable", exc_info=True)
+
             tool_gen_notified: set = set()
             # Ollama-compatible endpoints reuse index 0 for every tool call
             # in a parallel batch, distinguishing them only by id.  Track
@@ -8129,6 +8142,7 @@ class AIAgent:
                                 entry["function"]["name"] = tc_delta.function.name
                             if tc_delta.function.arguments:
                                 entry["function"]["arguments"] += tc_delta.function.arguments
+                        _preview_arguments(idx, entry)
                         extra = getattr(tc_delta, "extra_content", None)
                         if extra is None and hasattr(tc_delta, "model_extra"):
                             extra = (tc_delta.model_extra or {}).get("extra_content")
@@ -8166,6 +8180,7 @@ class AIAgent:
                 mock_tool_calls = []
                 for idx in sorted(tool_calls_acc):
                     tc = tool_calls_acc[idx]
+                    _preview_arguments(idx, tc, final=True)
                     arguments = tc["function"]["arguments"]
                     tool_name = tc["function"]["name"] or "?"
                     if arguments and arguments.strip():
