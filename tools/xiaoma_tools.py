@@ -2623,7 +2623,7 @@ registry.register(
                 },
                 "episode_contract": {
                     "type": "object",
-                    "description": "Optional structured prewrite contract for the requested logical episode range in episodes/script.md. Must include scene_plan, opening_conflict, protagonist_goal, ending_hook, target_chars_min, target_chars_max, os_budget.",
+                    "description": "Optional structured prewrite contract for the requested logical episode range in episodes/script.md. Must include scene_plan, opening_conflict, protagonist_goal, ending_hook, target_chars_min, target_chars_max, os_budget. W-script-submit-contract-gap, three submission rules: (1) RANGE EXCLUSIVITY: content must contain ONLY the requested episode range; continuity anchors outside the range are dropped server-side, never merge them in. (2) TITLE FORMAT: every episode starts with its own standalone title line like 第1集; never merge episodes into one title or rewrite the title format. (3) REJECTION ECHO: a rejection names the exact cause (no_script_target/parse_failed/empty_episodes/range_mismatch); fix exactly that cause and resubmit, never blindly retry.",
                 },
             },
             "required": ["path", "content"],
