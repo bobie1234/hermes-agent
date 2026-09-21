@@ -41,6 +41,13 @@ from packages.episode_outline_contract import (
 from packages.episode_revision_contract import (
     validate_pending_episode_revision_paths,
 )
+from packages.xiaoma_identity_policy import (
+    _WRITE_POLICIES_BY_RUN as _IDENTITY_POLICIES_BY_RUN,
+    _WRITE_POLICIES_BY_THREAD as _IDENTITY_POLICIES_BY_THREAD,
+    active_project_write_policy as _active_identity_policy,
+    clear_project_write_policy as _clear_identity_policy,
+    set_project_write_policy as _set_identity_policy,
+)
 from xiaoma.orchestrator_episode_batches import keep_existing_pending_payload, pending_write_key
 
 
@@ -204,12 +211,10 @@ def _projects_root_for(project_id: str):
 
 _MAX_CARD_CHARS = 5000
 _MAX_CARD_SUMMARY_CHARS = 900
-_WRITE_POLICIES_BY_THREAD: dict[int, dict] = {}
-# run_id → policy: worker 线程按本轮 run 显式取得冻结上下文的唯一通道
-#（P2 权威身份返工）。键精确匹配，不做"最近一个"兜底。
-# 注：旧 _WRITE_POLICIES_BY_PROJECT（project_id→policy）已删除——全仓只写
-# 不读，其注释自称的 worker 回退职责从未实现，保留即是误导。
-_WRITE_POLICIES_BY_RUN: dict[str, dict] = {}
+# Compatibility aliases for existing tests/tools.  The actual owner is the
+# neutral packages registry so ordinary chat never imports this Hermes module.
+_WRITE_POLICIES_BY_THREAD = _IDENTITY_POLICIES_BY_THREAD
+_WRITE_POLICIES_BY_RUN = _IDENTITY_POLICIES_BY_RUN
 _METHODOLOGY_TRACES_BY_THREAD: dict[int, dict] = {}
 # run_id → trace: lets ThreadPoolExecutor worker threads (which have a
 # different ident and never see the main thread's registration) reach the same
@@ -857,20 +862,9 @@ def set_project_write_policy(policy: dict | None, *, run_id: str = "") -> None:
 
     P2 权威身份返工：策略同时按 run_id 登记（_WRITE_POLICIES_BY_RUN），
     worker 线程凭本轮 run_id 显式取得同一份冻结上下文，不再靠"最近一个"
-    猜。run_id 与 policy["run_id"] 不一致时以显式参数为准（调用方必须传
-    本轮真实 run）。
+    猜。run_id 与 policy["run_id"] 不一致时拒绝登记，调用方必须传本轮真实 run。
     """
-    thread_id = threading.get_ident()
-    if policy is None:
-        _WRITE_POLICIES_BY_THREAD.pop(thread_id, None)
-        if run_id:
-            _WRITE_POLICIES_BY_RUN.pop(str(run_id), None)
-        return
-    normalized_run_id = str(run_id or policy.get("run_id") or "").strip()
-    if normalized_run_id:
-        policy["run_id"] = normalized_run_id
-        _WRITE_POLICIES_BY_RUN[normalized_run_id] = policy
-    _WRITE_POLICIES_BY_THREAD[thread_id] = policy
+    _set_identity_policy(policy, run_id=run_id)
 
 
 def clear_project_write_policy(*, run_id: str = "") -> None:
@@ -880,14 +874,7 @@ def clear_project_write_policy(*, run_id: str = "") -> None:
     因此按 run_id 横扫所有线程绑定，不只清当前线程。请求结束、异常和取消
     路径都必须带 run_id 调用（orchestrator finally 保证）。
     """
-    _WRITE_POLICIES_BY_THREAD.pop(threading.get_ident(), None)
-    normalized_run_id = str(run_id or "").strip()
-    if not normalized_run_id:
-        return
-    _WRITE_POLICIES_BY_RUN.pop(normalized_run_id, None)
-    for thread_id, bound in list(_WRITE_POLICIES_BY_THREAD.items()):
-        if isinstance(bound, dict) and str(bound.get("run_id") or "").strip() == normalized_run_id:
-            _WRITE_POLICIES_BY_THREAD.pop(thread_id, None)
+    _clear_identity_policy(run_id=run_id)
 
 
 def _policy_run_id_from_trace() -> str:
@@ -913,12 +900,7 @@ def active_project_write_policy(*, run_id: str = "") -> Optional[dict]:
     两者皆无即 None（调用方 fail-closed），绝不返回别的 run 的策略，
     也绝不把"最近 set 的任意策略"当成当前策略。
     """
-    normalized_run_id = str(run_id or "").strip()
-    if normalized_run_id:
-        bound = _WRITE_POLICIES_BY_RUN.get(normalized_run_id)
-        if bound is not None:
-            return bound
-    return _WRITE_POLICIES_BY_THREAD.get(threading.get_ident())
+    return _active_identity_policy(run_id=run_id)
 
 
 def _active_workspace_snapshot_cache() -> dict:
