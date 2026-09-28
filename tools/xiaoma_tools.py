@@ -1931,7 +1931,10 @@ def write_project_doc(args: dict, **kw) -> str:
 
         if is_episode_outline_path(normalized_path):
             try:
-                validate_episode_outline_content(content)
+                validate_episode_outline_content(
+                    content,
+                    allow_partial=policy.get("bridge_source") == "quick-story-sidecar-drive",
+                )
             except ValueError as exc:
                 return _tool_failure("write_project_doc", project_id, str(exc))
 
