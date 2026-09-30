@@ -2222,19 +2222,11 @@ def list_ledger(args: dict, **kw) -> str:
 
 def _resolve_knowledge_path(source: str) -> Optional[Path]:
     """Resolve a knowledge file path (from index.yaml source field) to an absolute path."""
-    path = Path(source)
-    if path.is_absolute():
-        return path if path.exists() else None
-    candidates = [
-        _KNOWLEDGE_ROOT / path,
-        _STABLE_ROOT / path,
-        _STABLE_ROOT.parent / path,
-        _KNOWLEDGE_ROOT.parent / path,
-    ]
-    for c in candidates:
-        if c.exists() and c.is_file():
-            return c.resolve()
-    return None
+    from packages.knowledge.card_content import resolve_knowledge_path
+
+    # This tool's legacy _KNOWLEDGE_ROOT is processed/, while index paths
+    # are relative to the canonical knowledge directory.
+    return resolve_knowledge_path(source, knowledge_root=_STABLE_ROOT.parent)
 
 
 def _read_index_card_content(file_path: Path, source: str) -> str:
