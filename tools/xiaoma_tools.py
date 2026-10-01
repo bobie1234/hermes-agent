@@ -969,15 +969,18 @@ def _project_doc_read_satisfies(required_path: str, read_docs: list[str] | tuple
 def _is_multi_episode_batch_policy(policy: Optional[dict] = None) -> bool:
     """True when multi-episode batch must continue after one write fail/success."""
     pol = policy if isinstance(policy, dict) else (active_project_write_policy(run_id=_policy_run_id_from_trace()) or {})
-    action = str(pol.get("action_intent") or "").strip()
-    if action == "workflow2_execute":
-        return True
     raw_target = pol.get("script_target")
     if isinstance(raw_target, dict):
         try:
             return parse_script_target(raw_target).episode_range.count > 1
         except ScriptDocumentError:
             return False
+    # The scheduler also uses workflow2_execute for a frozen one-episode batch.
+    # Its collected candidate must return to verification/commit without another
+    # model turn. Only fall back to the legacy action when no scope is available.
+    action = str(pol.get("action_intent") or "").strip()
+    if action == "workflow2_execute":
+        return True
     specific = [
         str(item).replace("\\", "/").strip()
         for item in (pol.get("allowed_specific_writes") or [])
