@@ -918,8 +918,13 @@ def _active_workspace_snapshot_cache() -> dict:
 
 
 def _episode_rewrite_frozen_files() -> Optional[dict]:
-    """Consume the original policy cache; never replace the full screenplay buffer."""
+    """Keep episode rewrite/check reads within the original frozen cache."""
     policy = active_project_write_policy(run_id=_policy_run_id_from_trace()) or {}
+    if policy.get("page") == "episodes" and policy.get("action_intent") == "check_problems":
+        files = _active_workspace_snapshot_cache().get("files")
+        if not isinstance(files, dict) or any(not isinstance(content, str) for content in files.values()):
+            raise ScriptDocumentError("正文检查缺少冻结读取缓存，不能从磁盘补读。")
+        return files
     if policy.get("action_intent") != "episode_rewrite":
         return None
     parse_single_episode_revision_target(policy.get("script_target"))
@@ -1407,6 +1412,13 @@ def read_project_doc(args: dict, **kw) -> str:
     """
     project_id = args.get("project_id", "")
     path = args.get("path", "")
+    policy = active_project_write_policy(run_id=_policy_run_id_from_trace()) or {}
+    frozen_check = policy.get("page") == "episodes" and policy.get("action_intent") == "check_problems"
+    if frozen_check:
+        requested_path = str(path or "").strip().replace("\\", "/")
+        if (requested_path.startswith("/") or ":" in requested_path or "\x00" in requested_path
+                or ".." in requested_path.split("/")):
+            return _tool_failure("read_project_doc", project_id, "Invalid frozen project path")
     path = _canonical_project_doc_path(path).replace("\\", "/").strip().lstrip("./")
 
     if path.startswith("episodes/") and path != SCRIPT_PATH:
@@ -1432,7 +1444,7 @@ def read_project_doc(args: dict, **kw) -> str:
         or stripped_for_dir.endswith("/")
         or ("." not in Path(stripped_for_dir).name)
     )
-    if looks_like_dir and _resolve_project_dir(project_id, path) is not None:
+    if looks_like_dir and (frozen_check or _resolve_project_dir(project_id, path) is not None):
         return list_project_docs(
             {
                 "project_id": project_id,
@@ -1442,8 +1454,8 @@ def read_project_doc(args: dict, **kw) -> str:
         )
 
     _emit_progress("read", path, phase="started")
-    target = _resolve_project_path(project_id, path)
-    if target is None:
+    target = None if frozen_check else _resolve_project_path(project_id, path)
+    if target is None and not frozen_check:
         _emit_progress("read", path, phase="failed")
         return _tool_failure(
             "read_project_doc",
@@ -1463,7 +1475,9 @@ def read_project_doc(args: dict, **kw) -> str:
     snapshot_files = frozen_files if frozen_files is not None else (snapshot_cache.get("files") if isinstance(snapshot_cache.get("files"), dict) else {})
     if path in snapshot_files:
         content = str(snapshot_files.get(path) or "")
-        if frozen_files is not None and path == SCRIPT_PATH:
+        if frozen_files is not None and path == SCRIPT_PATH and (
+            (active_project_write_policy(run_id=_policy_run_id_from_trace()) or {}).get("action_intent") == "episode_rewrite"
+        ):
             try:
                 policy = active_project_write_policy(run_id=_policy_run_id_from_trace()) or {}
                 _, content = single_episode_revision_context(content, policy.get("script_target"))
@@ -1590,11 +1604,23 @@ def list_project_docs(args: dict, **kw) -> str:
     err = _check_project_id(project_id)
     if err:
         return tool_error(err)
+    policy = active_project_write_policy(run_id=_policy_run_id_from_trace()) or {}
+    frozen_check = policy.get("page") == "episodes" and policy.get("action_intent") == "check_problems"
+    if frozen_check:
+        requested_path = str(path or "").strip().replace("\\", "/")
+        if (requested_path not in {"", ".", "/", "./"} and (
+                requested_path.startswith("/") or ":" in requested_path or "\x00" in requested_path
+                or ".." in requested_path.split("/"))):
+            return _tool_failure("list_project_docs", project_id, "Invalid frozen project path")
+        if _is_project_cancelled(project_id):
+            return _tool_failure("list_project_docs", project_id, "本轮任务已停止，拒绝继续读取项目内容。")
 
     # If the model listed a concrete file path by mistake, read it instead of
     # failing Invalid directory (common free-chat recovery loop).
     stripped_list = str(path or "").strip().replace(chr(92), "/").strip("/")
     if stripped_list and "." in Path(stripped_list).name:
+        if frozen_check:
+            return read_project_doc({"project_id": project_id, "path": path})
         file_target = _resolve_project_path(project_id, stripped_list)
         if file_target is not None:
             return read_project_doc({"project_id": project_id, "path": stripped_list})
@@ -1624,7 +1650,9 @@ def list_project_docs(args: dict, **kw) -> str:
             }
             if include_content:
                 content = str(child.get("content") or "")
-                if frozen_files is not None and item["path"] == SCRIPT_PATH:
+                if frozen_files is not None and item["path"] == SCRIPT_PATH and (
+                    (active_project_write_policy(run_id=_policy_run_id_from_trace()) or {}).get("action_intent") == "episode_rewrite"
+                ):
                     try:
                         policy = active_project_write_policy(run_id=_policy_run_id_from_trace()) or {}
                         _, content = single_episode_revision_context(frozen_files[SCRIPT_PATH], policy.get("script_target"))
@@ -2237,6 +2265,24 @@ def list_ledger(args: dict, **kw) -> str:
     if err:
         return tool_error(err)
 
+    policy = active_project_write_policy(run_id=_policy_run_id_from_trace()) or {}
+    try:
+        frozen_files = _episode_rewrite_frozen_files() if (
+            policy.get("page") == "episodes" and policy.get("action_intent") == "check_problems"
+        ) else None
+    except ScriptDocumentError as exc:
+        return _tool_failure("list_ledger", project_id, str(exc))
+    if frozen_files is not None:
+        files = [
+            {"name": Path(path).name, "path": path, "content": content}
+            for path, content in sorted(frozen_files.items())
+            if path.startswith("ledger/") and "/" not in path.removeprefix("ledger/")
+        ]
+        snapshot_dirs = _active_workspace_snapshot_cache().get("dirs")
+        if not files and not (isinstance(snapshot_dirs, dict) and "ledger" in snapshot_dirs):
+            return _tool_failure("list_ledger", project_id, "冻结快照中没有账本读取范围，不能从磁盘补读。")
+        _append_unique_trace_list("ledger_docs_read", "ledger/")
+        return tool_result(success=True, files=files, count=len(files), source="workspace_snapshot")
     ledger_dir = (_PROJECTS_ROOT / project_id / "ledger").resolve()
     try:
         ledger_dir.relative_to((_PROJECTS_ROOT / project_id).resolve())
