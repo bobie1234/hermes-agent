@@ -52,7 +52,9 @@ from toolset_distributions import (
     sample_toolsets_from_distribution,
     validate_distribution
 )
-from model_tools import TOOL_TO_TOOLSET_MAP
+from model_tools import TOOL_TO_TOOLSET_MAP, ensure_default_tools
+
+ensure_default_tools()
 
 
 # Global configuration for worker processes

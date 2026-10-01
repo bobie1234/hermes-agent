@@ -161,7 +161,7 @@ from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import CostResult, estimate_usage_cost, normalize_usage
 from agent.codex_responses_adapter import (
     _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
     _deterministic_call_id as _codex_deterministic_call_id,
@@ -1185,6 +1185,9 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         openai_metadata_only_urls: tuple[str, ...] = (),
+        tool_definitions: Optional[List[Dict[str, Any]]] = None,
+        compression_enabled: Optional[bool] = None,
+        tool_cancel_check: Optional[callable] = None,
     ):
         """
         Initialize the AI Agent.
@@ -1238,6 +1241,8 @@ class AIAgent:
         _install_safe_stdio()
 
         self.model = model
+        self._explicit_tool_definitions = tool_definitions is not None
+        self.tool_cancel_check = tool_cancel_check
         self.max_iterations = max_iterations
         # Shared iteration budget — parent creates, children inherit.
         # Consumed by every LLM turn across parent + all subagents.
@@ -1837,7 +1842,7 @@ class AIAgent:
                       " → ".join(f"{f['model']} ({f['provider']})" for f in self._fallback_chain))
 
         # Get available tools with filtering
-        self.tools = get_tool_definitions(
+        self.tools = list(tool_definitions) if tool_definitions is not None else get_tool_definitions(
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
             quiet_mode=self.quiet_mode,
@@ -2090,6 +2095,9 @@ class AIAgent:
         if not isinstance(_agent_section, dict):
             _agent_section = {}
         self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
+        if self._explicit_tool_definitions:
+            self._memory_nudge_interval = 0
+            self._skill_nudge_interval = 0
 
         # Transport failover belongs to the application model gateway. Hermes
         # must make one provider request and return the structured result; a
@@ -2110,7 +2118,8 @@ class AIAgent:
                 compression_threshold = _model_cthresh
         except Exception:
             pass
-        compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
+        if compression_enabled is None:
+            compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
         compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
         compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
         # protect_first_n is the number of non-system messages to protect at
@@ -2259,7 +2268,8 @@ class AIAgent:
         # AFTER the custom_providers branch so per-model overrides aren't lost.
         self._config_context_length = _config_context_length
 
-        self._ensure_lmstudio_runtime_loaded(_config_context_length)
+        if not self._explicit_tool_definitions:
+            self._ensure_lmstudio_runtime_loaded(_config_context_length)
 
 
 
@@ -2268,78 +2278,81 @@ class AIAgent:
         # 2. Check plugins/context_engine/<name>/ directory (repo-shipped)
         # 3. Check general plugin system (user-installed plugins)
         # 4. Fall back to built-in ContextCompressor
-        _selected_engine = None
-        _engine_name = "compressor"  # default
-        try:
-            _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
-            _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
-        except Exception:
-            pass
-
-        if _engine_name != "compressor":
-            # Try loading from plugins/context_engine/<name>/
+        self.context_compressor = None
+        if not self._explicit_tool_definitions:
+            _selected_engine = None
+            _engine_name = "compressor"  # default
             try:
-                from plugins.context_engine import load_context_engine
-                _selected_engine = load_context_engine(_engine_name)
-            except Exception as _ce_load_err:
-                logger.debug("Context engine load from plugins/context_engine/: %s", _ce_load_err)
+                _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
+                _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
+            except Exception:
+                pass
 
-            # Try general plugin system as fallback
-            if _selected_engine is None:
+            if _engine_name != "compressor":
+                # Try loading from plugins/context_engine/<name>/
                 try:
-                    from hermes_cli.plugins import get_plugin_context_engine
-                    _candidate = get_plugin_context_engine()
-                    if _candidate and _candidate.name == _engine_name:
-                        _selected_engine = _candidate
-                except Exception:
-                    pass
+                    from plugins.context_engine import load_context_engine
+                    _selected_engine = load_context_engine(_engine_name)
+                except Exception as _ce_load_err:
+                    logger.debug("Context engine load from plugins/context_engine/: %s", _ce_load_err)
 
-            if _selected_engine is None:
-                logger.warning(
-                    "Context engine '%s' not found — falling back to built-in compressor",
-                    _engine_name,
+                # Try general plugin system as fallback
+                if _selected_engine is None:
+                    if not self._explicit_tool_definitions:
+                        try:
+                            from hermes_cli.plugins import get_plugin_context_engine
+                            _candidate = get_plugin_context_engine()
+                            if _candidate and _candidate.name == _engine_name:
+                                _selected_engine = _candidate
+                        except Exception:
+                            pass
+
+                if _selected_engine is None:
+                    logger.warning(
+                        "Context engine '%s' not found — falling back to built-in compressor",
+                        _engine_name,
+                    )
+            # else: config says "compressor" — use built-in, don't auto-activate plugins
+
+            if _selected_engine is not None:
+                self.context_compressor = _selected_engine
+                # Resolve context_length for plugin engines — mirrors switch_model() path
+                from agent.model_metadata import get_model_context_length
+                _plugin_ctx_len = get_model_context_length(
+                    self.model,
+                    base_url=self.base_url,
+                    api_key=getattr(self, "api_key", ""),
+                    config_context_length=_config_context_length,
+                    provider=self.provider,
+                    custom_providers=_custom_providers,
+                    openai_metadata_only_urls=self._openai_metadata_only_urls,
                 )
-        # else: config says "compressor" — use built-in, don't auto-activate plugins
-
-        if _selected_engine is not None:
-            self.context_compressor = _selected_engine
-            # Resolve context_length for plugin engines — mirrors switch_model() path
-            from agent.model_metadata import get_model_context_length
-            _plugin_ctx_len = get_model_context_length(
-                self.model,
-                base_url=self.base_url,
-                api_key=getattr(self, "api_key", ""),
-                config_context_length=_config_context_length,
-                provider=self.provider,
-                custom_providers=_custom_providers,
-                openai_metadata_only_urls=self._openai_metadata_only_urls,
-            )
-            self.context_compressor.update_model(
-                model=self.model,
-                context_length=_plugin_ctx_len,
-                base_url=self.base_url,
-                api_key=getattr(self, "api_key", ""),
-                provider=self.provider,
-            )
-            if not self.quiet_mode:
-                logger.info("Using context engine: %s", _selected_engine.name)
-        else:
-            self.context_compressor = ContextCompressor(
-                model=self.model,
-                threshold_percent=compression_threshold,
-                protect_first_n=compression_protect_first,
-                protect_last_n=compression_protect_last,
-                summary_target_ratio=compression_target_ratio,
-                summary_model_override=None,
-                quiet_mode=self.quiet_mode,
-                base_url=self.base_url,
-                api_key=getattr(self, "api_key", ""),
-                config_context_length=_config_context_length,
-                provider=self.provider,
-                api_mode=self.api_mode,
-                openai_metadata_only_urls=self._openai_metadata_only_urls,
-            )
-        self.compression_enabled = compression_enabled
+                self.context_compressor.update_model(
+                    model=self.model,
+                    context_length=_plugin_ctx_len,
+                    base_url=self.base_url,
+                    api_key=getattr(self, "api_key", ""),
+                    provider=self.provider,
+                )
+                if not self.quiet_mode:
+                    logger.info("Using context engine: %s", _selected_engine.name)
+            else:
+                self.context_compressor = ContextCompressor(
+                    model=self.model,
+                    threshold_percent=compression_threshold,
+                    protect_first_n=compression_protect_first,
+                    protect_last_n=compression_protect_last,
+                    summary_target_ratio=compression_target_ratio,
+                    summary_model_override=None,
+                    quiet_mode=self.quiet_mode,
+                    base_url=self.base_url,
+                    api_key=getattr(self, "api_key", ""),
+                    config_context_length=_config_context_length,
+                    provider=self.provider,
+                    api_mode=self.api_mode,
+                    openai_metadata_only_urls=self._openai_metadata_only_urls,
+                )
+        self.compression_enabled = bool(compression_enabled and not self._explicit_tool_definitions)
 
         # Reject models whose context window is below the minimum required
         # for reliable tool-calling workflows (64K tokens).
@@ -2428,7 +2441,7 @@ class AIAgent:
                 self._ollama_num_ctx = int(_ollama_num_ctx_override)
             except (TypeError, ValueError):
                 logger.debug("Invalid ollama_num_ctx config value: %r", _ollama_num_ctx_override)
-        if self._ollama_num_ctx is None and self.base_url and is_local_endpoint(self.base_url):
+        if not self._explicit_tool_definitions and self._ollama_num_ctx is None and self.base_url and is_local_endpoint(self.base_url):
             try:
                 _detected = query_ollama_num_ctx(self.model, self.base_url, api_key=self.api_key or "")
                 if _detected and _detected > 0:
@@ -2456,7 +2469,7 @@ class AIAgent:
                 self._ollama_num_ctx,
             )
 
-        if not self.quiet_mode:
+        if not self.quiet_mode and self.context_compressor is not None:
             if compression_enabled:
                 print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (compress at {int(compression_threshold*100)}% = {self.context_compressor.threshold_tokens:,})")
             else:
@@ -2466,7 +2479,8 @@ class AIAgent:
         # Gateway status_callback is not yet wired, so any warning is stored
         # in _compression_warning and replayed in the first run_conversation().
         self._compression_warning = None
-        self._check_compression_model_feasibility()
+        if self.context_compressor is not None:
+            self._check_compression_model_feasibility()
 
         # Snapshot primary runtime for per-turn restoration.  When fallback
         # activates during a turn, the next turn restores these values so the
@@ -2489,8 +2503,8 @@ class AIAgent:
             "compressor_base_url": getattr(_cc, "base_url", self.base_url),
             "compressor_api_key": getattr(_cc, "api_key", ""),
             "compressor_provider": getattr(_cc, "provider", self.provider),
-            "compressor_context_length": _cc.context_length,
-            "compressor_threshold_tokens": _cc.threshold_tokens,
+            "compressor_context_length": getattr(_cc, "context_length", None),
+            "compressor_threshold_tokens": getattr(_cc, "threshold_tokens", None),
         }
         if self.api_mode == "anthropic_messages":
             self._primary_runtime.update({
@@ -10662,7 +10676,7 @@ class AIAgent:
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
-            if not _should_parallelize_tool_batch(tool_calls):
+            if self._explicit_tool_definitions or not _should_parallelize_tool_batch(tool_calls):
                 return self._execute_tool_calls_sequential(
                     assistant_message, messages, effective_task_id, api_call_count
                 )
@@ -10701,16 +10715,21 @@ class AIAgent:
         tools. Used by the concurrent execution path; the sequential path retains
         its own inline invocation for backward-compatible display handling.
         """
+        if self._explicit_tool_definitions:
+            return handle_function_call(function_name, function_args, effective_task_id,
+                tool_call_id=tool_call_id, session_id=self.session_id or "",
+                tool_definitions=self.tools, cancel_check=self.tool_cancel_check)
         # Check plugin hooks for a block directive before executing anything.
         block_message: Optional[str] = None
         if not pre_tool_block_checked:
-            try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                block_message = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
-                )
-            except Exception:
-                pass
+            if not self._explicit_tool_definitions:
+                try:
+                    from hermes_cli.plugins import get_pre_tool_call_block_message
+                    block_message = get_pre_tool_call_block_message(
+                        function_name, function_args, task_id=effective_task_id or "",
+                    )
+                except Exception:
+                    pass
         if block_message is not None:
             return json.dumps({"error": block_message}, ensure_ascii=False)
 
@@ -10867,13 +10886,14 @@ class AIAgent:
 
             block_result = None
             blocked_by_guardrail = False
-            try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                block_message = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
-                )
-            except Exception:
-                block_message = None
+            if not self._explicit_tool_definitions:
+                try:
+                    from hermes_cli.plugins import get_pre_tool_call_block_message
+                    block_message = get_pre_tool_call_block_message(
+                        function_name, function_args, task_id=effective_task_id or "",
+                    )
+                except Exception:
+                    block_message = None
 
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
@@ -11243,15 +11263,20 @@ class AIAgent:
             if not isinstance(function_args, dict):
                 function_args = {}
 
+            if self._explicit_tool_definitions:
+                result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id, messages)
+                messages.append({"role": "tool", "name": function_name, "content": result, "tool_call_id": tool_call.id})
+                continue
             # Check plugin hooks for a block directive before executing.
             _block_msg: Optional[str] = None
-            try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                _block_msg = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
-                )
-            except Exception:
-                pass
+            if not self._explicit_tool_definitions:
+                try:
+                    from hermes_cli.plugins import get_pre_tool_call_block_message
+                    _block_msg = get_pre_tool_call_block_message(
+                        function_name, function_args, task_id=effective_task_id or "",
+                    )
+                except Exception:
+                    pass
 
             _guardrail_block_decision: ToolGuardrailDecision | None = None
             if _block_msg is None:
@@ -12120,16 +12145,17 @@ class AIAgent:
                 # Fired once when a brand-new session is created (not on
                 # continuation).  Plugins can use this to initialise
                 # session-scoped state (e.g. warm a memory cache).
-                try:
-                    from hermes_cli.plugins import invoke_hook as _invoke_hook
-                    _invoke_hook(
-                        "on_session_start",
-                        session_id=self.session_id,
-                        model=self.model,
-                        platform=getattr(self, "platform", None) or "",
-                    )
-                except Exception as exc:
-                    logger.warning("on_session_start hook failed: %s", exc)
+                if not self._explicit_tool_definitions:
+                    try:
+                        from hermes_cli.plugins import invoke_hook as _invoke_hook
+                        _invoke_hook(
+                            "on_session_start",
+                            session_id=self.session_id,
+                            model=self.model,
+                            platform=getattr(self, "platform", None) or "",
+                        )
+                    except Exception as exc:
+                        logger.warning("on_session_start hook failed: %s", exc)
 
                 # Store the system prompt snapshot in SQLite
                 if self._session_db:
@@ -12221,28 +12247,29 @@ class AIAgent:
         #
         # All injected context is ephemeral (not persisted to session DB).
         _plugin_user_context = ""
-        try:
-            from hermes_cli.plugins import invoke_hook as _invoke_hook
-            _pre_results = _invoke_hook(
-                "pre_llm_call",
-                session_id=self.session_id,
-                user_message=original_user_message,
-                conversation_history=list(messages),
-                is_first_turn=(not bool(conversation_history)),
-                model=self.model,
-                platform=getattr(self, "platform", None) or "",
-                sender_id=getattr(self, "_user_id", None) or "",
-            )
-            _ctx_parts: list[str] = []
-            for r in _pre_results:
-                if isinstance(r, dict) and r.get("context"):
-                    _ctx_parts.append(str(r["context"]))
-                elif isinstance(r, str) and r.strip():
-                    _ctx_parts.append(r)
-            if _ctx_parts:
-                _plugin_user_context = "\n\n".join(_ctx_parts)
-        except Exception as exc:
-            logger.warning("pre_llm_call hook failed: %s", exc)
+        if not self._explicit_tool_definitions:
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                _pre_results = _invoke_hook(
+                    "pre_llm_call",
+                    session_id=self.session_id,
+                    user_message=original_user_message,
+                    conversation_history=list(messages),
+                    is_first_turn=(not bool(conversation_history)),
+                    model=self.model,
+                    platform=getattr(self, "platform", None) or "",
+                    sender_id=getattr(self, "_user_id", None) or "",
+                )
+                _ctx_parts: list[str] = []
+                for r in _pre_results:
+                    if isinstance(r, dict) and r.get("context"):
+                        _ctx_parts.append(str(r["context"]))
+                    elif isinstance(r, str) and r.strip():
+                        _ctx_parts.append(r)
+                if _ctx_parts:
+                    _plugin_user_context = "\n\n".join(_ctx_parts)
+            except Exception as exc:
+                logger.warning("pre_llm_call hook failed: %s", exc)
 
         # Main conversation loop
         api_call_count = 0
@@ -12316,7 +12343,7 @@ class AIAgent:
                 should_review_memory=_should_review_memory,
             )
 
-        while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
+        while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or (self._budget_grace_call and not self._explicit_tool_definitions):
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
             self._checkpoint_mgr.new_turn()
 
@@ -12704,46 +12731,49 @@ class AIAgent:
 
                 try:
                     self._reset_stream_delivery_tracking()
+                    if self._explicit_tool_definitions and self.tool_cancel_check is not None:
+                        self.tool_cancel_check()
                     api_kwargs = self._build_api_kwargs(api_messages)
                     if self._force_ascii_payload:
                         _sanitize_structure_non_ascii(api_kwargs)
                     if self.api_mode == "codex_responses":
                         api_kwargs = self._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
 
-                    try:
-                        from hermes_cli.plugins import invoke_hook as _invoke_hook
-                        request_messages = api_kwargs.get("messages")
-                        if not isinstance(request_messages, list):
-                            request_messages = api_kwargs.get("input")
-                        if not isinstance(request_messages, list):
-                            request_messages = api_messages
-                        # Shallow-copy the outer list so plugins that retain the
-                        # reference for async snapshotting don't observe later
-                        # mutations of api_messages.  The inner dicts are not
-                        # mutated by the agent loop, so a shallow copy is
-                        # sufficient; a deepcopy would walk every tool result
-                        # and base64 image on every API call.
-                        _invoke_hook(
-                            "pre_api_request",
-                            task_id=effective_task_id,
-                            session_id=self.session_id or "",
-                            user_message=original_user_message,
-                            conversation_history=list(messages),
-                            platform=self.platform or "",
-                            model=self.model,
-                            provider=self.provider,
-                            base_url=self.base_url,
-                            api_mode=self.api_mode,
-                            api_call_count=api_call_count,
-                            request_messages=list(request_messages) if isinstance(request_messages, list) else [],
-                            message_count=len(api_messages),
-                            tool_count=len(self.tools or []),
-                            approx_input_tokens=approx_tokens,
-                            request_char_count=total_chars,
-                            max_tokens=self.max_tokens,
-                        )
-                    except Exception:
-                        pass
+                    if not self._explicit_tool_definitions:
+                        try:
+                            from hermes_cli.plugins import invoke_hook as _invoke_hook
+                            request_messages = api_kwargs.get("messages")
+                            if not isinstance(request_messages, list):
+                                request_messages = api_kwargs.get("input")
+                            if not isinstance(request_messages, list):
+                                request_messages = api_messages
+                            # Shallow-copy the outer list so plugins that retain the
+                            # reference for async snapshotting don't observe later
+                            # mutations of api_messages.  The inner dicts are not
+                            # mutated by the agent loop, so a shallow copy is
+                            # sufficient; a deepcopy would walk every tool result
+                            # and base64 image on every API call.
+                            _invoke_hook(
+                                "pre_api_request",
+                                task_id=effective_task_id,
+                                session_id=self.session_id or "",
+                                user_message=original_user_message,
+                                conversation_history=list(messages),
+                                platform=self.platform or "",
+                                model=self.model,
+                                provider=self.provider,
+                                base_url=self.base_url,
+                                api_mode=self.api_mode,
+                                api_call_count=api_call_count,
+                                request_messages=list(request_messages) if isinstance(request_messages, list) else [],
+                                message_count=len(api_messages),
+                                tool_count=len(self.tools or []),
+                                approx_input_tokens=approx_tokens,
+                                request_char_count=total_chars,
+                                max_tokens=self.max_tokens,
+                            )
+                        except Exception:
+                            pass
 
                     if env_var_enabled("HERMES_DUMP_REQUESTS"):
                         self._dump_api_request_debug(api_kwargs, reason="preflight")
@@ -13263,7 +13293,8 @@ class AIAgent:
                             "completion_tokens": completion_tokens,
                             "total_tokens": total_tokens,
                         }
-                        self.context_compressor.update_from_response(usage_dict)
+                        if self.context_compressor is not None:
+                            self.context_compressor.update_from_response(usage_dict)
 
                         # Cache discovered context length after successful call.
                         # Only persist limits confirmed by the provider (parsed
@@ -13297,7 +13328,7 @@ class AIAgent:
                             api_duration, _cache_pct,
                         )
 
-                        cost_result = estimate_usage_cost(
+                        cost_result = CostResult(amount_usd=None, status="unknown", source="none", label="n/a") if self._explicit_tool_definitions else estimate_usage_cost(
                             self.model,
                             canonical_usage,
                             provider=self.provider,
@@ -13411,6 +13442,8 @@ class AIAgent:
                         thinking_spinner = None
                     if self.thinking_callback:
                         self.thinking_callback("")
+                    if self._explicit_tool_definitions and self.tool_cancel_check is not None:
+                        self.tool_cancel_check()
 
                     # -----------------------------------------------------------
                     # UnicodeEncodeError recovery.  Two common causes:
@@ -14622,32 +14655,33 @@ class AIAgent:
                     else:
                         assistant_message.content = str(raw)
 
-                try:
-                    from hermes_cli.plugins import invoke_hook as _invoke_hook
-                    _assistant_tool_calls = getattr(assistant_message, "tool_calls", None) or []
-                    _assistant_text = assistant_message.content or ""
-                    _invoke_hook(
-                        "post_api_request",
-                        task_id=effective_task_id,
-                        session_id=self.session_id or "",
-                        platform=self.platform or "",
-                        model=self.model,
-                        provider=self.provider,
-                        base_url=self.base_url,
-                        api_mode=self.api_mode,
-                        api_call_count=api_call_count,
-                        api_duration=api_duration,
-                        finish_reason=finish_reason,
-                        message_count=len(api_messages),
-                        response_model=getattr(response, "model", None),
-                        response=response,
-                        usage=self._usage_summary_for_api_request_hook(response),
-                        assistant_message=assistant_message,
-                        assistant_content_chars=len(_assistant_text),
-                        assistant_tool_call_count=len(_assistant_tool_calls),
-                    )
-                except Exception:
-                    pass
+                if not self._explicit_tool_definitions:
+                    try:
+                        from hermes_cli.plugins import invoke_hook as _invoke_hook
+                        _assistant_tool_calls = getattr(assistant_message, "tool_calls", None) or []
+                        _assistant_text = assistant_message.content or ""
+                        _invoke_hook(
+                            "post_api_request",
+                            task_id=effective_task_id,
+                            session_id=self.session_id or "",
+                            platform=self.platform or "",
+                            model=self.model,
+                            provider=self.provider,
+                            base_url=self.base_url,
+                            api_mode=self.api_mode,
+                            api_call_count=api_call_count,
+                            api_duration=api_duration,
+                            finish_reason=finish_reason,
+                            message_count=len(api_messages),
+                            response_model=getattr(response, "model", None),
+                            response=response,
+                            usage=self._usage_summary_for_api_request_hook(response),
+                            assistant_message=assistant_message,
+                            assistant_content_chars=len(_assistant_text),
+                            assistant_tool_call_count=len(_assistant_tool_calls),
+                        )
+                    except Exception:
+                        pass
 
                 # Handle assistant response
                 if assistant_message.content and not self.quiet_mode:
@@ -15060,7 +15094,7 @@ class AIAgent:
                     # a session can grow unbounded after disconnects because
                     # should_compress(0) never fires.  (#2153)
                     _compressor = self.context_compressor
-                    if _compressor.last_prompt_tokens > 0:
+                    if _compressor is not None and _compressor.last_prompt_tokens > 0:
                         # Only use prompt_tokens — completion/reasoning
                         # tokens don't consume context window space.
                         # Thinking models (GLM-5.1, QwQ, DeepSeek R1)
@@ -15429,6 +15463,8 @@ class AIAgent:
                 
             except Exception as e:
                 error_msg = f"Error during OpenAI-compatible API call #{api_call_count}: {str(e)}"
+                if self._explicit_tool_definitions and self.tool_cancel_check is not None:
+                    self.tool_cancel_check()
                 try:
                     print(f"❌ {error_msg}")
                 except (OSError, ValueError):
@@ -15495,7 +15531,11 @@ class AIAgent:
                     f"\n⚠️  Iteration budget exhausted ({api_call_count}/{self.max_iterations}) "
                     "— requesting summary..."
                 )
-            final_response = self._handle_max_iterations(messages, api_call_count)
+            final_response = (
+                "本轮灵感讨论已达到轮次限制，请继续补充需求后再试。"
+                if self._explicit_tool_definitions
+                else self._handle_max_iterations(messages, api_call_count)
+            )
 
             # If running as a kanban worker, block the task so the dispatcher
             # knows the worker could not complete (rather than treating it as a
@@ -15503,7 +15543,7 @@ class AIAgent:
             # _handle_max_iterations, so the model cannot call kanban_block
             # itself — we must do it on its behalf.
             _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
-            if _kanban_task:
+            if _kanban_task and not self._explicit_tool_definitions:
                 try:
                     handle_function_call(
                         "kanban_block",
@@ -15622,40 +15662,42 @@ class AIAgent:
         # Plugins can transform the LLM's output text before it's returned.
         # First hook to return a string wins; None/empty return leaves text unchanged.
         if final_response and not interrupted:
-            try:
-                from hermes_cli.plugins import invoke_hook as _invoke_hook
-                _transform_results = _invoke_hook(
-                    "transform_llm_output",
-                    response_text=final_response,
-                    session_id=self.session_id or "",
-                    model=self.model,
-                    platform=getattr(self, "platform", None) or "",
-                )
-                for _hook_result in _transform_results:
-                    if isinstance(_hook_result, str) and _hook_result:
-                        final_response = _hook_result
-                        break  # First non-empty string wins
-            except Exception as exc:
-                logger.warning("transform_llm_output hook failed: %s", exc)
+            if not self._explicit_tool_definitions:
+                try:
+                    from hermes_cli.plugins import invoke_hook as _invoke_hook
+                    _transform_results = _invoke_hook(
+                        "transform_llm_output",
+                        response_text=final_response,
+                        session_id=self.session_id or "",
+                        model=self.model,
+                        platform=getattr(self, "platform", None) or "",
+                    )
+                    for _hook_result in _transform_results:
+                        if isinstance(_hook_result, str) and _hook_result:
+                            final_response = _hook_result
+                            break  # First non-empty string wins
+                except Exception as exc:
+                    logger.warning("transform_llm_output hook failed: %s", exc)
 
         # Plugin hook: post_llm_call
         # Fired once per turn after the tool-calling loop completes.
         # Plugins can use this to persist conversation data (e.g. sync
         # to an external memory system).
         if final_response and not interrupted:
-            try:
-                from hermes_cli.plugins import invoke_hook as _invoke_hook
-                _invoke_hook(
-                    "post_llm_call",
-                    session_id=self.session_id,
-                    user_message=original_user_message,
-                    assistant_response=final_response,
-                    conversation_history=list(messages),
-                    model=self.model,
-                    platform=getattr(self, "platform", None) or "",
-                )
-            except Exception as exc:
-                logger.warning("post_llm_call hook failed: %s", exc)
+            if not self._explicit_tool_definitions:
+                try:
+                    from hermes_cli.plugins import invoke_hook as _invoke_hook
+                    _invoke_hook(
+                        "post_llm_call",
+                        session_id=self.session_id,
+                        user_message=original_user_message,
+                        assistant_response=final_response,
+                        conversation_history=list(messages),
+                        model=self.model,
+                        platform=getattr(self, "platform", None) or "",
+                    )
+                except Exception as exc:
+                    logger.warning("post_llm_call hook failed: %s", exc)
 
         # Extract reasoning from the CURRENT turn only.  Walk backwards
         # but stop at the user message that started this turn — anything
@@ -15697,7 +15739,7 @@ class AIAgent:
             "completion_tokens": self.session_completion_tokens,
             "total_tokens": self.session_total_tokens,
             "last_prompt_tokens": getattr(self.context_compressor, "last_prompt_tokens", 0) or 0,
-            "estimated_cost_usd": self.session_estimated_cost_usd,
+            "estimated_cost_usd": None if self._explicit_tool_definitions else self.session_estimated_cost_usd,
             "cost_status": self.session_cost_status,
             "cost_source": self.session_cost_source,
         }
@@ -15758,18 +15800,19 @@ class AIAgent:
         # Plugin hook: on_session_end
         # Fired at the very end of every run_conversation call.
         # Plugins can use this for cleanup, flushing buffers, etc.
-        try:
-            from hermes_cli.plugins import invoke_hook as _invoke_hook
-            _invoke_hook(
-                "on_session_end",
-                session_id=self.session_id,
-                completed=completed,
-                interrupted=interrupted,
-                model=self.model,
-                platform=getattr(self, "platform", None) or "",
-            )
-        except Exception as exc:
-            logger.warning("on_session_end hook failed: %s", exc)
+        if not self._explicit_tool_definitions:
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                _invoke_hook(
+                    "on_session_end",
+                    session_id=self.session_id,
+                    completed=completed,
+                    interrupted=interrupted,
+                    model=self.model,
+                    platform=getattr(self, "platform", None) or "",
+                )
+            except Exception as exc:
+                logger.warning("on_session_end hook failed: %s", exc)
 
         return result
 

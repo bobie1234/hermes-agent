@@ -4,7 +4,7 @@ Model Tools Module
 
 Thin orchestration layer over the tool registry. Each tool file in tools/
 self-registers its schema, handler, and metadata via tools.registry.register().
-This module triggers discovery (by importing all tool modules), then provides
+Default consumers explicitly bootstrap discovery (by importing tool modules), then use
 the public API that run_agent.py, cli.py, batch_runner.py, and the RL
 environments consume.
 
@@ -175,36 +175,38 @@ def _run_async(coro):
 # Tool Discovery  (importing each module triggers its registry.register calls)
 # =============================================================================
 
-discover_builtin_tools()
-
-# MCP tool discovery (external MCP servers from config) used to run here as
-# a module-level side effect.  It was removed because discover_mcp_tools()
-# internally uses a blocking future.result(timeout=120) wait, and the
-# gateway lazy-imports this module from inside the asyncio event loop on
-# the first user message — freezing Discord/Telegram heartbeats for up to
-# 120s whenever any configured MCP server was slow or unreachable (#16856).
-#
-# Each entry point now runs discovery explicitly at its own startup:
-#   - gateway/run.py            -> start_gateway() uses run_in_executor
-#   - cli.py, hermes_cli/*      -> inline on startup (no event loop)
-#   - tui_gateway/server.py     -> inline on startup (no event loop)
-#   - acp_adapter/server.py     -> asyncio.to_thread on session init
-
-# Plugin tool discovery (user/project/pip plugins)
-try:
-    from hermes_cli.plugins import discover_plugins
-    discover_plugins()
-except Exception as e:
-    logger.debug("Plugin discovery failed: %s", e)
-
-
 # =============================================================================
-# Backward-compat constants  (built once after discovery)
+# Backward-compat constants (populated in place by default discovery)
 # =============================================================================
 
 TOOL_TO_TOOLSET_MAP: Dict[str, str] = registry.get_tool_to_toolset_map()
 
 TOOLSET_REQUIREMENTS: Dict[str, dict] = registry.get_toolset_requirements()
+
+_default_discovery_lock = threading.RLock()
+_default_discovery_started = False
+
+
+def ensure_default_tools() -> None:
+    """Discover only when a default tool consumer explicitly requests the full set."""
+    global _default_discovery_started
+    with _default_discovery_lock:
+        if _default_discovery_started:
+            return
+        _default_discovery_started = True
+        try:
+            discover_builtin_tools()
+        except Exception:
+            _default_discovery_started = False
+            raise
+        try:
+            from hermes_cli.plugins import discover_plugins
+            discover_plugins()
+        except Exception as exc:
+            logger.debug("Plugin tool discovery failed: %s", exc)
+        TOOL_TO_TOOLSET_MAP.update(registry.get_tool_to_toolset_map())
+        TOOLSET_REQUIREMENTS.update(registry.get_toolset_requirements())
+
 
 # Resolved tool names from the last get_tool_definitions() call.
 # Used by code_execution_tool to know which tools are available in this session.
@@ -277,6 +279,7 @@ def get_tool_definitions(
     Returns:
         Filtered list of OpenAI-format tool definitions.
     """
+    ensure_default_tools()
     # Ensure xiaoma_tools is imported to register the xiaoma_project toolset
     # This is a lazy import to avoid overhead when tools are not needed
     try:
@@ -701,6 +704,8 @@ def handle_function_call(
     user_task: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     skip_pre_tool_call_hook: bool = False,
+    tool_definitions: Optional[List[dict]] = None,
+    cancel_check=None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -718,6 +723,18 @@ def handle_function_call(
     Returns:
         Function result as a JSON string.
     """
+    if cancel_check is not None:
+        cancel_check()
+    if tool_definitions is not None:
+        allowed = {tool["function"]["name"] for tool in tool_definitions}
+        if function_name not in allowed:
+            return json.dumps({"error": f"Tool {function_name} is not enabled"})
+        result = registry.dispatch(function_name, coerce_tool_args(function_name, function_args), task_id=task_id, user_task=user_task)
+        if cancel_check is not None:
+            cancel_check()
+        return result
+    if enabled_tools is not None and function_name not in enabled_tools:
+        return json.dumps({"error": f"Tool {function_name} is not enabled"})
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
 
@@ -840,24 +857,30 @@ def handle_function_call(
 
 def get_all_tool_names() -> List[str]:
     """Return all registered tool names."""
+    ensure_default_tools()
     return registry.get_all_tool_names()
 
 
 def get_toolset_for_tool(tool_name: str) -> Optional[str]:
     """Return the toolset a tool belongs to."""
+    if registry.get_entry(tool_name) is None:
+        ensure_default_tools()
     return registry.get_toolset_for_tool(tool_name)
 
 
 def get_available_toolsets() -> Dict[str, dict]:
     """Return toolset availability info for UI display."""
+    ensure_default_tools()
     return registry.get_available_toolsets()
 
 
 def check_toolset_requirements() -> Dict[str, bool]:
     """Return {toolset: available_bool} for every registered toolset."""
+    ensure_default_tools()
     return registry.check_toolset_requirements()
 
 
 def check_tool_availability(quiet: bool = False) -> Tuple[List[str], List[dict]]:
     """Return (available_toolsets, unavailable_info)."""
+    ensure_default_tools()
     return registry.check_tool_availability(quiet=quiet)
