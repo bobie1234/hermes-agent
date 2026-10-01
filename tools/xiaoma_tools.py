@@ -39,6 +39,9 @@ from packages.episode_outline_contract import (
     validate_episode_outline_content,
 )
 from packages.episode_revision_contract import (
+    SINGLE_EPISODE_SOURCE_PATHS,
+    parse_single_episode_revision_target,
+    single_episode_revision_context,
     validate_pending_episode_revision_paths,
 )
 from packages.xiaoma_identity_policy import (
@@ -303,12 +306,15 @@ def _hermes_canonicalization_context(project_id: str) -> CanonicalizationContext
     """
 
     snapshot_cache = _active_workspace_snapshot_cache()
-    snapshot_files = snapshot_cache.get("files") if isinstance(snapshot_cache.get("files"), dict) else {}
+    frozen_files = _episode_rewrite_frozen_files()
+    snapshot_files = frozen_files if frozen_files is not None else (snapshot_cache.get("files") if isinstance(snapshot_cache.get("files"), dict) else {})
 
     def _read_file(path: str) -> str:
         normalized = str(path or "").replace("\\", "/").strip().strip("/")
         if normalized in snapshot_files:
             return str(snapshot_files[normalized] or "")
+        if frozen_files is not None:
+            raise FileNotFoundError(f"frozen project document not found: {path}")
         resolved = _resolve_project_path(project_id, path)
         if resolved is None or not resolved.exists():
             raise FileNotFoundError(f"project document not found: {path}")
@@ -318,6 +324,8 @@ def _hermes_canonicalization_context(project_id: str) -> CanonicalizationContext
         normalized = str(path or "").replace("\\", "/").strip().strip("/")
         if normalized in snapshot_files:
             return normalized
+        if frozen_files is not None:
+            return None
         resolved = _resolve_project_path(project_id, path)
         return str(resolved) if resolved is not None else None
 
@@ -909,6 +917,21 @@ def _active_workspace_snapshot_cache() -> dict:
     return cache if isinstance(cache, dict) else {}
 
 
+def _episode_rewrite_frozen_files() -> Optional[dict]:
+    """Consume the original policy cache; never replace the full screenplay buffer."""
+    policy = active_project_write_policy(run_id=_policy_run_id_from_trace()) or {}
+    if policy.get("action_intent") != "episode_rewrite":
+        return None
+    parse_single_episode_revision_target(policy.get("script_target"))
+    files = _active_workspace_snapshot_cache().get("files")
+    if not isinstance(files, dict) or any(
+        not isinstance(files.get(path), str) or not files[path].strip()
+        for path in SINGLE_EPISODE_SOURCE_PATHS
+    ):
+        raise ScriptDocumentError("单集修改缺少完整冻结来源，不能从磁盘补读。")
+    return files
+
+
 def _normalize_project_doc_trace_path(path: str, *, is_dir: bool = False) -> str:
     raw = str(path or "").strip().replace("\\", "/")
     if raw in {"", ".", "/", "./"}:
@@ -1433,9 +1456,19 @@ def read_project_doc(args: dict, **kw) -> str:
         )
 
     snapshot_cache = _active_workspace_snapshot_cache()
-    snapshot_files = snapshot_cache.get("files") if isinstance(snapshot_cache.get("files"), dict) else {}
+    try:
+        frozen_files = _episode_rewrite_frozen_files()
+    except ScriptDocumentError as exc:
+        return _tool_failure("read_project_doc", project_id, str(exc))
+    snapshot_files = frozen_files if frozen_files is not None else (snapshot_cache.get("files") if isinstance(snapshot_cache.get("files"), dict) else {})
     if path in snapshot_files:
         content = str(snapshot_files.get(path) or "")
+        if frozen_files is not None and path == SCRIPT_PATH:
+            try:
+                policy = active_project_write_policy(run_id=_policy_run_id_from_trace()) or {}
+                _, content = single_episode_revision_context(content, policy.get("script_target"))
+            except ScriptDocumentError as exc:
+                return _tool_failure("read_project_doc", project_id, str(exc))
         _append_unique_trace_list("project_docs_read", path)
         _emit_progress("read", path, phase="completed")
         return tool_result(
@@ -1445,6 +1478,9 @@ def read_project_doc(args: dict, **kw) -> str:
             bytes=len(content),
             source="workspace_snapshot",
         )
+
+    if frozen_files is not None:
+        return _tool_failure("read_project_doc", project_id, f"冻结快照中没有 {path}，不能从磁盘补读。")
 
     if not target.exists():
         _emit_progress("read", path, phase="failed")
@@ -1565,6 +1601,10 @@ def list_project_docs(args: dict, **kw) -> str:
 
     _emit_progress("list", path or ".", phase="started")
     snapshot_cache = _active_workspace_snapshot_cache()
+    try:
+        frozen_files = _episode_rewrite_frozen_files()
+    except ScriptDocumentError as exc:
+        return _tool_failure("list_project_docs", project_id, str(exc))
     snapshot_dirs = snapshot_cache.get("dirs") if isinstance(snapshot_cache.get("dirs"), dict) else {}
     normalized_input = "" if (path or "").strip() in {"", ".", "/", "./", "\\"} else (path or "").strip().replace("\\", "/").strip("/")
     if normalized_input in snapshot_dirs:
@@ -1584,6 +1624,12 @@ def list_project_docs(args: dict, **kw) -> str:
             }
             if include_content:
                 content = str(child.get("content") or "")
+                if frozen_files is not None and item["path"] == SCRIPT_PATH:
+                    try:
+                        policy = active_project_write_policy(run_id=_policy_run_id_from_trace()) or {}
+                        _, content = single_episode_revision_context(frozen_files[SCRIPT_PATH], policy.get("script_target"))
+                    except ScriptDocumentError as exc:
+                        return _tool_failure("list_project_docs", project_id, str(exc))
                 item["content_preview"] = content[:max_chars]
                 item["truncated"] = len(content) > max_chars
                 _append_unique_trace_list("project_docs_read", item["path"])
@@ -1602,6 +1648,8 @@ def list_project_docs(args: dict, **kw) -> str:
         )
 
     target = _resolve_project_dir(project_id, path)
+    if frozen_files is not None:
+        return _tool_failure("list_project_docs", project_id, f"冻结快照中没有目录 {path}，不能从磁盘补读。")
     if target is None:
         _emit_progress("list", path or ".", phase="failed")
         return tool_error(
@@ -1942,10 +1990,9 @@ def write_project_doc(args: dict, **kw) -> str:
             normalized_path == "ledger/pending_episode_revisions.json"
             and str(policy.get("action_intent") or "").strip() == "episode_rewrite"
         ):
-            script_file = _PROJECTS_ROOT / project_id / Path(SCRIPT_PATH)
             try:
-                script_content = script_file.read_text(encoding="utf-8")
-            except (OSError, UnicodeError) as exc:
+                script_content = _episode_rewrite_frozen_files()[SCRIPT_PATH]
+            except ScriptDocumentError as exc:
                 return _tool_failure(
                     "write_project_doc",
                     project_id,
