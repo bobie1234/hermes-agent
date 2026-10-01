@@ -2220,32 +2220,6 @@ def list_ledger(args: dict, **kw) -> str:
     return tool_result(success=True, files=files, count=len(files))
 
 
-def _resolve_knowledge_path(source: str) -> Optional[Path]:
-    """Resolve a knowledge file path (from index.yaml source field) to an absolute path."""
-    from packages.knowledge.card_content import resolve_knowledge_path
-
-    # This tool's legacy _KNOWLEDGE_ROOT is processed/, while index paths
-    # are relative to the canonical knowledge directory.
-    return resolve_knowledge_path(source, knowledge_root=_STABLE_ROOT.parent)
-
-
-def _read_index_card_content(file_path: Path, source: str) -> str:
-    try:
-        content = file_path.read_text(encoding="utf-8")
-        if "\ufffd" in content:
-            logger.warning("Indexed knowledge card contains replacement characters: %s", source)
-            _append_unique_trace_list("warnings", f"knowledge_card_replacement_chars: {source}")
-            content = content.replace("\ufffd", "")
-        return content.strip()
-    except UnicodeDecodeError as exc:
-        logger.warning("Indexed knowledge card is not UTF-8 readable: %s: %s", source, exc)
-        _append_unique_trace_list("warnings", f"knowledge_card_unreadable: {source}")
-    except OSError as exc:
-        logger.warning("Indexed knowledge card could not be read: %s: %s", source, exc)
-        _append_unique_trace_list("warnings", f"knowledge_card_read_failed: {source}")
-    return ""
-
-
 def retrieve_market_cards(args: dict, **kw) -> str:
     """Retrieve approved knowledge cards with index-based retrieval and priority scoring.
 
@@ -2295,28 +2269,27 @@ def retrieve_market_cards(args: dict, **kw) -> str:
                 market=market,
             )
             for ir in index_results:
-                file_path = _resolve_knowledge_path(ir["path"])
-                if file_path:
-                    full_content = _read_index_card_content(file_path, ir["path"])
-                    if full_content:
-                        summary = _compact_card_content(full_content, budget)
-                        cards.append({
-                            "path": ir["path"],
-                            "id": ir["id"],
-                            "title": ir.get("title", ""),
-                            "layer": ir["layer"],
-                            "priority": ir["priority"],
-                            "priority_order": ir.get("priority_order"),
-                            "score": ir["score"],
-                            "reason": ir["reason"],
-                            "summary": summary,
-                            "truncated": len(full_content) > len(summary),
-                        })
-                        budget -= len(summary)
-                        score_reasons.append(f"{ir['id']}: {ir['reason']}")
+                full_content = ir.get("content")
+                if isinstance(full_content, str) and full_content.strip():
+                    summary = _compact_card_content(full_content, budget)
+                    cards.append({
+                        "path": ir["path"],
+                        "id": ir["id"],
+                        "title": ir.get("title", ""),
+                        "layer": ir["layer"],
+                        "priority": ir["priority"],
+                        "priority_order": ir.get("priority_order"),
+                        "score": ir["score"],
+                        "reason": ir["reason"],
+                        "wiki_id": ir.get("wiki_id", ""),
+                        "wiki_revision": ir.get("wiki_revision", ""),
+                        "summary": summary,
+                        "truncated": len(full_content) > len(summary),
+                    })
+                    budget -= len(summary)
+                    score_reasons.append(f"{ir['id']}: {ir['reason']}")
                 if budget <= 0:
                     break
-
             conflicts = conflict_check(cards)
         except Exception as exc:
             logger.warning("Index retrieval failed: %s", exc)
