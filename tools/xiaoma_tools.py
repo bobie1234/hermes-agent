@@ -2162,16 +2162,41 @@ def write_project_doc(args: dict, **kw) -> str:
         _emit_artifact_ready(project_id, normalized_path, _canonical_content, manifest=_manifest)
     else:
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if _episode_target is not None:
-                existing_content = target.read_text(encoding="utf-8") if target.exists() else ""
-                content = merge_episode_range(existing_content, _episode_target.episode_range, content)
-            from packages.atomic_file import replace_atomic
-            from packages.workspace_text import decode_workspace_bytes, normalize_workspace_text
+            from packages.project_write_lock import hold_project_write_lock
 
-            content = normalize_workspace_text(content)
-            replace_atomic(target, content.encode("utf-8"))
-            written_back = decode_workspace_bytes(target.read_bytes())
+            with hold_project_write_lock(project_id, workspace_root=_PROJECTS_ROOT) as acquired:
+                if not acquired:
+                    return _tool_failure("write_project_doc", project_id, "该项目正在写入，请稍后再试")
+                from packages.story_authority import (
+                    formal_downstream_write_owner,
+                    validate_formal_downstream_write,
+                )
+
+                if formal_downstream_write_owner(normalized_path) is not None:
+                    try:
+                        validate_formal_downstream_write(
+                            _PROJECTS_ROOT / project_id,
+                            project_id=project_id,
+                            path=normalized_path,
+                            content=content,
+                        )
+                    except ValueError as exc:
+                        _emit_progress("write", normalized_path, phase="failed")
+                        return _tool_failure(
+                            "write_project_doc", project_id, str(exc),
+                            failure_code=str(getattr(exc, "code", "story_authority_invalid")),
+                        )
+
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if _episode_target is not None:
+                    existing_content = target.read_text(encoding="utf-8") if target.exists() else ""
+                    content = merge_episode_range(existing_content, _episode_target.episode_range, content)
+                from packages.atomic_file import replace_atomic
+                from packages.workspace_text import decode_workspace_bytes, normalize_workspace_text
+
+                content = normalize_workspace_text(content)
+                replace_atomic(target, content.encode("utf-8"))
+                written_back = decode_workspace_bytes(target.read_bytes())
         except OSError as exc:
             return _tool_failure("write_project_doc", project_id, f"Write error: {exc}")
         except Exception as exc:
