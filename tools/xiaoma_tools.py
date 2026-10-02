@@ -2354,6 +2354,20 @@ def retrieve_market_cards(args: dict, **kw) -> str:
             "retrieve_market_cards 需要合法 market 参数（domestic|overseas|thailand）；"
             "海外项目禁止检索国内知识索引，market 缺失时不回退全库。"
         )
+    query_kind = args.get("query_kind", "methodology")
+    if query_kind not in ("methodology", "rankings"):
+        return tool_error("query_kind 必须是 methodology 或 rankings")
+    if query_kind == "rankings":
+        from packages.market_ranking_query import query_market_rankings
+        try:
+            result = query_market_rankings(
+                market=market, top_n=args.get("top_n", 5),
+                period=args.get("period", ""), scope=args.get("scope", ""),
+                max_chars=args.get("max_chars", _MAX_CARD_CHARS),
+            )
+        except (ValueError, TypeError, OSError) as exc:
+            return tool_error(f"排名资料不可查询：{exc}")
+        return tool_result(success=True, **result)
     stage = (args.get("stage") or "inspiration").strip()
     fmt = (args.get("format") or "manhua").strip()
     topic = _normalize_topic(args.get("topic") or "")
@@ -2736,7 +2750,7 @@ registry.register(
     toolset="xiaoma_project",
     schema={
         "name": "retrieve_market_cards",
-        "description": "Retrieve approved knowledge cards with index-based retrieval and priority scoring. Use before market judgment, synopsis, outline, or episode writing. Supports stage/topic/audience/task/problem filtering.",
+        "description": "Retrieve methodology cards by relevance, or dated chart observations with query_kind=rankings. For hottest/TopN questions use rankings; relevance scores are not heat ranks. Chart periods/scopes/sources and gaps must be retained; historical snapshots do not prove current popularity.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -2769,6 +2783,10 @@ registry.register(
                     "description": "Maximum returned content characters, capped by the tool",
                 },
                 "market": dict(_MARKET_TOOL_PARAM),
+                "query_kind": {"type": "string", "enum": ["methodology", "rankings"], "description": "Use rankings for popularity/rank questions; methodology for writing mechanisms."},
+                "top_n": {"type": "integer", "minimum": 1, "maximum": 20},
+                "period": {"type": "string", "description": "Exact source chart period; omit to inspect available historical periods. Never substitute document date."},
+                "scope": {"type": "string", "description": "Exact chart scope; omit to inspect separate available charts, never merge them."},
             },
             "required": ["stage", "market"],
         },
