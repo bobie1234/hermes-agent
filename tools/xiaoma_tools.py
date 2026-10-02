@@ -2335,164 +2335,9 @@ def list_ledger(args: dict, **kw) -> str:
 
 
 def retrieve_market_cards(args: dict, **kw) -> str:
-    """Retrieve approved knowledge cards with index-based retrieval and priority scoring.
-
-    Schema:
-        stage (str): inspiration | synopsis | outline | episodes | character
-        format (str): manhua | short_drama
-        topic (str): optional topic alias, e.g. xianxia, rule-horror, 宅斗
-        audience (str): optional audience filter, e.g. male, female, mixed
-        task (str): optional task filter, e.g. brainstorm, synopsis, outline, write_batch, first_episode, revise, audit
-        problem (str): optional specific problem to search for, e.g. format, hook, pacing, character, dialogue
-        max_chars (int): optional maximum returned content characters
-        market (str): REQUIRED canonical market: domestic | overseas | thailand
-            (R6 市场隔离：海外请求排除国内索引；缺失 fail-closed 不回退全库)
-    """
-    market = (args.get("market") or "").strip().lower()
-    if market not in ("domestic", "overseas", "thailand"):
-        return tool_error(
-            "retrieve_market_cards 需要合法 market 参数（domestic|overseas|thailand）；"
-            "海外项目禁止检索国内知识索引，market 缺失时不回退全库。"
-        )
-    query_kind = args.get("query_kind", "methodology")
-    if query_kind not in ("methodology", "rankings"):
-        return tool_error("query_kind 必须是 methodology 或 rankings")
-    if query_kind == "rankings":
-        from packages.market_ranking_query import query_market_rankings
-        try:
-            result = query_market_rankings(
-                market=market, top_n=args.get("top_n", 5),
-                period=args.get("period", ""), scope=args.get("scope", ""),
-                max_chars=args.get("max_chars", _MAX_CARD_CHARS),
-            )
-        except (ValueError, TypeError, OSError) as exc:
-            return tool_error(f"排名资料不可查询：{exc}")
-        return tool_result(success=True, **result)
-    stage = (args.get("stage") or "inspiration").strip()
-    fmt = (args.get("format") or "manhua").strip()
-    topic = _normalize_topic(args.get("topic") or "")
-    audience = (args.get("audience") or "").strip()
-    task = (args.get("task") or "").strip()
-    problem = (args.get("problem") or "").strip()
-    budget = int(args.get("max_chars") or _MAX_CARD_CHARS)
-    budget = max(3000, min(budget, _MAX_CARD_CHARS))
-    topic_profile = get_topic_profile(topic) if topic else None
-    allow_fixed_fallback = os.environ.get("XIAOMA_ALLOW_FIXED_RETRIEVAL_FALLBACK", "").strip() == "1"
-
-    cards = []
-    conflicts = []
-    score_reasons = []
-
-    # --- Stage 1: Index-based retrieval (A-M02) ---
-    use_methodology_index = _METHODOLOGY_INDEX_AVAILABLE
-    if use_methodology_index:
-        try:
-            index_results = query_index(
-                stage=stage,
-                topic=topic,
-                audience=audience,
-                task=task,
-                problem=problem,
-                max_results=8,
-                market=market,
-            )
-            for ir in index_results:
-                full_content = ir.get("content")
-                if isinstance(full_content, str) and full_content.strip():
-                    summary = _compact_card_content(full_content, budget)
-                    cards.append({
-                        "path": ir["path"],
-                        "id": ir["id"],
-                        "title": ir.get("title", ""),
-                        "layer": ir["layer"],
-                        "priority": ir["priority"],
-                        "priority_order": ir.get("priority_order"),
-                        "score": ir["score"],
-                        "reason": ir["reason"],
-                        "wiki_id": ir.get("wiki_id", ""),
-                        "wiki_revision": ir.get("wiki_revision", ""),
-                        "summary": summary,
-                        "truncated": len(full_content) > len(summary),
-                    })
-                    budget -= len(summary)
-                    score_reasons.append(f"{ir['id']}: {ir['reason']}")
-                if budget <= 0:
-                    break
-            conflicts = conflict_check(cards)
-        except Exception as exc:
-            logger.warning("Index retrieval failed: %s", exc)
-            use_methodology_index = False
-
-    if _METHODOLOGY_INDEX_AVAILABLE and not cards and not allow_fixed_fallback:
-        return tool_error(
-            "知识索引未返回可用卡片。当前运行时已切到索引驱动主路径，"
-            "请补齐 topic-pack 子文件索引、题材 profile 或 retrieval profile，"
-            "不要再依赖固定文件 fallback。"
-        )
-
-    # --- Stage 2: Fixed-file fallback (explicitly opt-in for diagnostics only) ---
-    if not use_methodology_index:
-        if not allow_fixed_fallback:
-            return tool_error(
-                "知识索引不可用，且未开启诊断 fallback。请先修复 methodology_index 或显式设置 "
-                "XIAOMA_ALLOW_FIXED_RETRIEVAL_FALLBACK=1 做临时排查。"
-            )
-        for relative_path in _STABLE_STAGE_FILES.get(stage, _STABLE_STAGE_FILES["inspiration"]):
-            budget = _append_card(cards, _read_stable_file(relative_path), budget)
-            if budget <= 0:
-                break
-
-        for relative_path in _PROCESSED_STAGE_FILES.get(stage, _PROCESSED_STAGE_FILES["inspiration"]):
-            budget = _append_card(cards, _read_knowledge_file(_KNOWLEDGE_ROOT, relative_path), budget)
-            if budget <= 0:
-                break
-
-        for relative_path in _PATTERN_STAGE_FILES.get(stage, _PATTERN_STAGE_FILES["inspiration"]):
-            budget = _append_card(cards, _read_knowledge_file(_REDFRUIT_ROOT, relative_path), budget)
-            if budget <= 0:
-                break
-
-        for relative_path in _STAGE_FILES.get(stage, _STAGE_FILES["inspiration"]):
-            budget = _append_card(cards, _read_knowledge_file(_REDFRUIT_ROOT, relative_path), budget)
-            if budget <= 0:
-                break
-
-        if topic_profile and budget > 0:
-            topic_dir = (_TOPIC_PACKS_ROOT / topic_profile.topic_pack).resolve()
-            try:
-                topic_dir.relative_to(_TOPIC_PACKS_ROOT.resolve())
-            except ValueError:
-                topic_dir = None
-            if topic_dir and topic_dir.exists():
-                if budget > 0:
-                    for relative_path in _TOPIC_CASE_FILES.get(topic_profile.canonical_id, []):
-                        budget = _append_card(cards, _read_knowledge_file(_REDFRUIT_ROOT, relative_path), budget)
-                        if budget <= 0:
-                            break
-                if budget > 0:
-                    for filename in _TOPIC_STAGE_FILES.get(stage, _TOPIC_STAGE_FILES["inspiration"]):
-                        budget = _append_card(cards, _read_knowledge_file(topic_dir, filename), budget)
-                        if budget <= 0:
-                            break
-
-    _record_cards_retrieved(args, cards, conflicts)
-
-    return tool_result(
-        success=True,
-        stage=stage,
-        format=fmt,
-        topic=topic or None,
-        default_episode_range="80-99" if fmt in {"manhua", "ai-manhua", "AI仿真人漫剧", "漫剧"} else "按项目需求",
-        instruction=(
-            "这些卡片是趋势参考和可重组方法，不是抄袭模板。"
-            "漫剧默认按 80-99 集设计；若卡片里出现 60-80 集，以 80-99 集为当前口径。"
-            "卡片只返回摘要；需要全文时按 path 精确读取，不要反复扩大检索。"
-        ),
-        cards=cards,
-        count=len(cards),
-        score_summary=score_reasons if score_reasons else None,
-        conflicts=conflicts if conflicts else None,
-    )
+    """Return bounded complete published references through the shared owner."""
+    from packages.knowledge_retrieval import retrieve_market_cards as query_published
+    return query_published(args)
 
 
 def _strip_html(value: str) -> str:
@@ -2780,7 +2625,9 @@ registry.register(
                 },
                 "max_chars": {
                     "type": "integer",
-                    "description": "Maximum returned content characters, capped by the tool",
+                    "minimum": 1000,
+                    "maximum": 16000,
+                    "description": "Complete JSON response budget (default 5000). Entries are never truncated; omitted entries are unread. Narrow topic/problem or increase within 16000 if no complete entry fits.",
                 },
                 "market": dict(_MARKET_TOOL_PARAM),
                 "query_kind": {"type": "string", "enum": ["methodology", "rankings"], "description": "Use rankings for popularity/rank questions; methodology for writing mechanisms."},
