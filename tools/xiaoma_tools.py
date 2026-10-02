@@ -774,7 +774,7 @@ def _append_unique_trace_list(key: str, value) -> None:
 STOP_LOSS_FAILURE_LIMIT = 5
 
 
-def _tool_failure(tool_name: str, project_id: str, message: str) -> str:
+def _tool_failure(tool_name: str, project_id: str, message: str, *, failure_code: str = "episode_write_rejected") -> str:
     """Record repeated tool failures and stop a run after STOP_LOSS_FAILURE_LIMIT.
 
     A-STOPLOSS-THRESHOLD-BLACKBOX-01（根因级修法，波别 2026-06-15）：
@@ -800,16 +800,13 @@ def _tool_failure(tool_name: str, project_id: str, message: str) -> str:
         and str(policy.get("action_intent") or "") in {"preset_execute", "custom_execute", "workflow2_execute"}
     ):
         _append_unique_trace_list("warnings", f"episode_write_rejected_once: {message}")
-        # Multi-episode SSS/preset: refuse this call but keep the agent turn so
-        # remaining targets can still be written. Single-episode turns still stop.
-        if _is_multi_episode_batch_policy(policy):
-            return tool_error(
-                message + " 请改写或压缩后继续写本批剩余目标集，不要结束回合。",
-                stop_current_turn=False,
-            )
         trace["tool_hard_stop"] = {
             "tool": tool_name,
             "reason": "episode_write_rejected_once",
+        }
+        trace["execution_failure"] = {
+            "category": "contract_structure", "code": failure_code,
+            "message": message, "terminal": True,
         }
         trace["failure_stage"] = "episode_write_rejected"
         trace["completion_reached"] = False
@@ -1840,7 +1837,24 @@ def write_project_doc(args: dict, **kw) -> str:
     _episode_effective_chars: int | None = None
     _episode_attempt_payload: dict | None = None
     _episode_target = None
-    if isinstance(content, str) and path == SCRIPT_PATH:
+    if path == SCRIPT_PATH and (isinstance(content, str) or policy.get("script_submission") == "episode_bodies"):
+        if policy.get("script_submission") == "episode_bodies":
+            from packages.script_submission import ScriptSubmissionError, render_submission
+            # Retain the actual submission before validation; it is evidence, never a pending write.
+            submission_trace = _active_methodology_trace()
+            if isinstance(submission_trace, dict):
+                submission_trace["rejected_script_candidate"] = {
+                    "content": json.dumps(args, ensure_ascii=False), "format": "submission_json",
+                }
+            try:
+                if set(args) != {"path", "episodes"}:
+                    raise ScriptSubmissionError("episode_fields_invalid", "正文提交只接受 path 和 episodes，不接受 content 或自写集标题。")
+                content = render_submission(args.get("episodes"), policy.get("script_target"))
+            except ScriptSubmissionError as exc:
+                return _tool_failure("write_project_doc", project_id, str(exc), failure_code=exc.code)
+        submission_trace = _active_methodology_trace()
+        if isinstance(submission_trace, dict):
+            submission_trace["rejected_script_candidate"] = {"content": content, "format": "script"}
         content, _discarded_contract = _strip_episode_contract_block(content)
         if not content.strip():
             return _tool_failure("write_project_doc", project_id, "剧集正文为空，无法写入。")
@@ -1863,6 +1877,7 @@ def write_project_doc(args: dict, **kw) -> str:
                 "write_project_doc",
                 project_id,
                 _reason_guidance.get(str(_validate_reason), "剧集候选校验未通过（" + range_detail + "）。"),
+                failure_code=str(_validate_reason),
             )
         content, _episode_target = _validated_script
         normalized_path_for_gate = _normalize_project_doc_trace_path(path)
@@ -2209,6 +2224,9 @@ def write_project_doc(args: dict, **kw) -> str:
         and normalized_path == SCRIPT_PATH
         and not _multi_episode_batch
     )
+    success_trace = _active_methodology_trace()
+    if isinstance(success_trace, dict):
+        success_trace.pop("rejected_script_candidate", None)
     return tool_result(
         success=True,
         path=normalized_path,
