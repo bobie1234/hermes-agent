@@ -1839,7 +1839,7 @@ def write_project_doc(args: dict, **kw) -> str:
     _episode_target = None
     if path == SCRIPT_PATH and (isinstance(content, str) or policy.get("script_submission") == "episode_bodies"):
         if policy.get("script_submission") == "episode_bodies":
-            from packages.script_submission import ScriptSubmissionError, render_submission
+            from packages.script_submission import ScriptSubmissionError, split_submission
             # Retain the actual submission before validation; it is evidence, never a pending write.
             submission_trace = _active_methodology_trace()
             if isinstance(submission_trace, dict):
@@ -1849,9 +1849,22 @@ def write_project_doc(args: dict, **kw) -> str:
             try:
                 if set(args) != {"path", "episodes"}:
                     raise ScriptSubmissionError("episode_fields_invalid", "正文提交只接受 path 和 episodes，不接受 content 或自写集标题。")
-                content = render_submission(args.get("episodes"), policy.get("script_target"))
+                content, _declared_delta = split_submission(args.get("episodes"), policy.get("script_target"))
             except ScriptSubmissionError as exc:
                 return _tool_failure("write_project_doc", project_id, str(exc), failure_code=exc.code)
+            # 写手自报的状态变化先原样落盘，等结算时再按本集合同校验。
+            # 只作建议：写入失败、校验不过都不影响正文保存，也不阻断下一集。
+            if _declared_delta:
+                try:
+                    from packages.story_engine.declared_delta import persist_declared_delta
+
+                    _declared_root = _resolve_project_dir(project_id, "") or (_PROJECTS_ROOT / project_id)
+                    for _declared_episode, _declared_rows in _declared_delta.items():
+                        persist_declared_delta(
+                            _declared_root, episode=int(_declared_episode), rows=_declared_rows,
+                        )
+                except Exception:  # noqa: BLE001 - 声明只是建议，绝不影响正文交付
+                    logger.warning("declared state delta not persisted", exc_info=True)
         submission_trace = _active_methodology_trace()
         if isinstance(submission_trace, dict):
             submission_trace["rejected_script_candidate"] = {"content": content, "format": "script"}
