@@ -755,6 +755,12 @@ def _active_methodology_trace() -> Optional[dict]:
     # worker thread to the found trace so later writes in the same worker keep
     # hitting the same dict object.
     for tid, candidate in reversed(tuple(_METHODOLOGY_TRACES_BY_THREAD.items())):
+        if tid not in {t.ident for t in threading.enumerate()}:
+            # 死线程绑定是残留（worker 已随任务结束）：把它复活到当前线程，
+            # 会让已消费 run 的 trace 顶替当前 run 的身份（P2 要防的跨 run
+            # 串线），并让本 dict 随长驻进程无界增长。清掉，继续找活线程。
+            _METHODOLOGY_TRACES_BY_THREAD.pop(tid, None)
+            continue
         _METHODOLOGY_TRACES_BY_THREAD[threading.get_ident()] = candidate
         return candidate
     return None
