@@ -2046,7 +2046,10 @@ def write_project_doc(args: dict, **kw) -> str:
             try:
                 validate_episode_outline_content(
                     content,
-                    allow_partial=policy.get("bridge_source") == "quick-story-sidecar-drive",
+                    allow_partial=(
+                        policy.get("bridge_source") == "quick-story-sidecar-drive"
+                        or policy.get("action_intent") in {"episode_outline_plan_4", "episode_outline_plan_5"}
+                    ),
                 )
             except ValueError as exc:
                 return _tool_failure("write_project_doc", project_id, str(exc))
