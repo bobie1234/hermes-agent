@@ -1855,9 +1855,13 @@ def write_project_doc(args: dict, **kw) -> str:
             try:
                 if set(args) != {"path", "episodes"}:
                     raise ScriptSubmissionError("episode_fields_invalid", "正文提交只接受 path 和 episodes，不接受 content 或自写集标题。")
-                content, _declared_delta = split_submission(args.get("episodes"), policy.get("script_target"))
+                content, _declared_delta, _declaration_errors = split_submission(
+                    args.get("episodes"), policy.get("script_target"),
+                )
             except ScriptSubmissionError as exc:
                 return _tool_failure("write_project_doc", project_id, str(exc), failure_code=exc.code)
+            for _advisory in _declaration_errors:
+                logger.warning("declared state delta rejected: %s", _advisory)
             # 写手自报的状态变化先原样落盘，等结算时再按本集合同校验。
             # 只作建议：写入失败、校验不过都不影响正文保存，也不阻断下一集。
             if _declared_delta:
