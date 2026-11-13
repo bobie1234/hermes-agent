@@ -1478,6 +1478,19 @@ def read_project_doc(args: dict, **kw) -> str:
         frozen_files = _episode_rewrite_frozen_files()
     except ScriptDocumentError as exc:
         return _tool_failure("read_project_doc", project_id, str(exc))
+    if frozen_check and path == "ledger/problem_checklist.md":
+        _append_unique_trace_list("project_docs_read", path)
+        _emit_progress("read", path, phase="completed")
+        return tool_result(
+            success=True,
+            content=(
+                "历史问题清单不纳入本轮检查来源。请依据当前正文和正式设定重新判断；"
+                "本轮只生成新的修改计划，不照抄旧表格或其中的未核实结论。"
+            ),
+            path=path,
+            bytes=0,
+            source="workspace_snapshot",
+        )
     snapshot_files = frozen_files if frozen_files is not None else (snapshot_cache.get("files") if isinstance(snapshot_cache.get("files"), dict) else {})
     if path in snapshot_files:
         content = str(snapshot_files.get(path) or "")
